@@ -74,6 +74,20 @@ pub enum ExportFormat {
     Stl,
 }
 
+/// How decomposed exports write their textures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextureFormat {
+    /// Decoded to PNG (one mip level).
+    #[default]
+    Png,
+    /// The game's own block-compressed data, unchanged (BC1/3/4/5/7, every mip level from
+    /// `texture_mip` down), in a DDS compressed with zstd (`.dds.zst`), plus a small copy
+    /// (`.low.dds.zst`: the levels of 256 px and below) to show while the full one loads.
+    /// Normal maps, whose smoothness the game keeps in a separate file, are merged into one BC7
+    /// (normal X/Y in red/green, smoothness in alpha). Formats a browser can't read fall back to PNG.
+    Bc,
+}
+
 /// Options for controlling the export pipeline.
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
@@ -97,6 +111,8 @@ pub struct ExportOptions {
     pub lod_level: u32,
     /// Texture mip level (0 = full resolution, 2 = 1/4 res, 4 = 1/16 res).
     pub texture_mip: u32,
+    /// Texture files of decomposed exports: PNG or the game's block-compressed data.
+    pub texture_format: TextureFormat,
     /// Export animation clips into decomposed scene sidecars.
     pub include_animations: bool,
     /// Apply default-state animation poses (e.g. landing-gear-deployed) to
@@ -107,6 +123,35 @@ pub struct ExportOptions {
     /// when `apply_default_animation_pose` is enabled. The first match wins
     /// per skeleton. Default: `landing_gear_extend`.
     pub default_animation_tags: Vec<String>,
+    /// Wearables (armor, clothing, helmets…): the SubGeometry tag of the body
+    /// whose worn model to export ("Male", "Female"). `None` exports the
+    /// top-level geometry, the prop shown when the item is carried or dropped.
+    /// Entities without such a tag always export their top-level geometry.
+    pub body: Option<String>,
+    /// Material / tint palette to use instead of the record's own, for one entity (not the items
+    /// attached to it). Lets an export follow another build's records while reading the installed
+    /// game's assets.
+    pub overrides: Option<EntityOverrides>,
+    /// Decomposed: write every piece of a mesh with its own material slot, whatever the material file hides
+    /// (NoDraw, opacity 0) or lacks (a slot past its end). The mesh file is written once and shared by every
+    /// material file used with it (an item's colour variants), which can differ in what they hide: without this,
+    /// the first export decides the pieces and the numbering for all. The reader hides pieces by the sidecar.
+    pub keep_material_slots: bool,
+    /// Keep skinned meshes (.skin) deformable: each vertex keeps its bone weights and the mesh carries the
+    /// .skin's own bones, written as a glTF skin. A reader binds the joints to an animated skeleton by bone name.
+    /// Without it, skinned meshes are static in the bind pose (and the .cdf parts placed by the node chunk).
+    pub skinned: bool,
+}
+
+/// See `ExportOptions::overrides`.
+#[derive(Debug, Clone, Default)]
+pub struct EntityOverrides {
+    /// The entity they apply to: its record's short name (kap_combat_heavy_helmet_01_03_01).
+    pub record: String,
+    /// Material path, as the records write it (Objects/Characters/.../m_kap_combat_heavy_helmet_01_03.mtl).
+    pub material: Option<String>,
+    /// TintPaletteTree record short name (kap_combat_heavy_02_03_01); "none" for no palette.
+    pub palette: Option<String>,
 }
 
 impl Default for ExportOptions {
@@ -122,9 +167,14 @@ impl Default for ExportOptions {
             include_shields: false,
             lod_level: 1,
             texture_mip: 2,
+            texture_format: TextureFormat::Png,
             include_animations: false,
             apply_default_animation_pose: true,
             default_animation_tags: vec!["landing_gear_extend".to_string()],
+            body: Some("Male".to_string()),
+            overrides: None,
+            keep_material_slots: false,
+            skinned: false,
         }
     }
 }
@@ -283,6 +333,7 @@ fn export_entity_payload_cached(
     let material_path = db
         .query_single::<String>(&mtl_compiled, record)?
         .unwrap_or_default();
+    let (geometry_path, material_path) = worn_geometry(db, record, opts, geometry_path, material_path);
 
     let (
         mesh,
@@ -309,7 +360,10 @@ fn export_entity_payload_cached(
         ));
     }
 
-    let palette = query_tint_palette(db, record);
+    let palette = match overrides_for(db, record, opts).and_then(|o| o.palette.as_deref()) {
+        Some(name) => palette_by_name(db, name),
+        None => worn_palette(db, record, opts).or_else(|| query_tint_palette(db, record)),
+    };
     Ok((
         mesh,
         mtl_file,
@@ -321,6 +375,133 @@ fn export_entity_payload_cached(
         skeleton_bones,
         skeleton_source_path,
     ))
+}
+
+/// Wearables (armor, clothing, helmets, backpacks…) keep their prop in the top-level Geometry:
+/// the model shown when the item is carried, dropped or stored. The models a character wears are
+/// SubGeometry entries tagged with the body: "Male", "Female". Returns the paths of the one
+/// `opts.body` names when the record has it, else the top-level paths unchanged.
+fn worn_geometry(
+    db: &Database,
+    record: &Record,
+    opts: &ExportOptions,
+    geometry_path: String,
+    material_path: String,
+) -> (String, String) {
+    let (geometry_path, material_path) = match opts.body.as_deref() {
+        Some(body) => {
+            let variants = starbreaker_datacore::loadout::query_sub_geometry_variants(db, record);
+            match body_variant(variants, body) {
+                Some(v) => {
+                    log::info!("worn model for body '{body}': {} (instead of {geometry_path})", v.geometry_path);
+                    let material_path = if v.material_path.is_empty() { material_path } else { v.material_path };
+                    (v.geometry_path, material_path)
+                }
+                None => (geometry_path, material_path),
+            }
+        }
+        None => (geometry_path, material_path),
+    };
+    match overrides_for(db, record, opts).and_then(|o| o.material.clone()) {
+        Some(material) => {
+            log::info!("material override: {material} (instead of {material_path})");
+            (geometry_path, material)
+        }
+        None => (geometry_path, material_path),
+    }
+}
+
+/// The body `worn_geometry` picks the worn model of ("male", "female"), when the record has one.
+fn worn_body(db: &Database, record: &Record, opts: &ExportOptions) -> Option<String> {
+    let body = opts.body.as_deref()?;
+    body_variant(starbreaker_datacore::loadout::query_sub_geometry_variants(db, record), body)
+        .map(|_| body.to_ascii_lowercase())
+}
+
+/// The SubGeometry entry of `body`: the one tagged with the body alone, or else the first one with the
+/// fewest other tags among those nested under the body. The helmets' neck sock (universal_necksock_01)
+/// has its worn models one level down, "HeadWear" > "Male" > "NoDna" / "EVAHelmet" / "Short" (flattened to
+/// "headwear male nodna"...): until 2026-10-17 no entry was found and the export failed on its empty top level.
+/// `body` may name more tags after the body, which the entry must have too: "male short" is the neck sock's
+/// short model, the one the helmets whose PortFlags say "Short" take (the BUL-H4 helmets).
+fn body_variant(
+    variants: Vec<starbreaker_datacore::loadout::SubGeometryVariant>,
+    body: &str,
+) -> Option<starbreaker_datacore::loadout::SubGeometryVariant> {
+    let wanted: Vec<String> = body.split_whitespace().map(|t| t.to_ascii_lowercase()).collect();
+    let tokens = |v: &starbreaker_datacore::loadout::SubGeometryVariant| -> Vec<String> {
+        v.tag.split_whitespace().map(|t| t.to_ascii_lowercase()).collect()
+    };
+    if let Some(i) = variants.iter().position(|v| tokens(v) == wanted) {
+        return variants.into_iter().nth(i);
+    }
+    let mut matching: Vec<(usize, usize)> = variants
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| {
+            let have = tokens(v);
+            !wanted.is_empty() && wanted.iter().all(|t| have.contains(t))
+        })
+        .map(|(i, v)| (tokens(v).len(), i))
+        .collect();
+    matching.sort();
+    let &(_, best) = matching.first()?;
+    // No material on the entry: the next matching one's (the female short sock names it only one level
+    // further down, on "headwear female short nodna"; without it the model had no material at all)
+    let material = matching
+        .iter()
+        .map(|&(_, i)| &variants[i].material_path)
+        .find(|m| !m.is_empty())
+        .cloned()
+        .unwrap_or_default();
+    let mut chosen = variants.into_iter().nth(best)?;
+    if chosen.material_path.is_empty() {
+        chosen.material_path = material;
+    }
+    Some(chosen)
+}
+
+/// `opts.overrides`, when they are for this record.
+fn overrides_for<'o>(db: &Database, record: &Record, opts: &'o ExportOptions) -> Option<&'o EntityOverrides> {
+    let o = opts.overrides.as_ref()?;
+    let name = db.resolve_string2(record.name_offset);
+    name.rsplit('.').next().unwrap_or(name).eq_ignore_ascii_case(&o.record).then_some(o)
+}
+
+/// A TintPaletteTree record by its short name ("kap_combat_heavy_02_03_01"); "none": no palette.
+fn palette_by_name(db: &Database, name: &str) -> Option<mtl::TintPalette> {
+    if name.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let tree = db.struct_id("TintPaletteTree")?;
+    let record = db.records_of_type(tree).find(|r| {
+        let n = db.resolve_string2(r.name_offset);
+        n.rsplit('.').next().unwrap_or(n).eq_ignore_ascii_case(name)
+    });
+    if record.is_none() {
+        log::warn!("palette override: no TintPaletteTree record named {name}");
+    }
+    query_tint_from_record(db, record?, Some(name.to_lowercase()))
+}
+
+/// Tint palette of the worn model `opts.body` names (see `worn_geometry`). Newer armors
+/// (kap_combat_heavy_core_02...) only set it there: their top level is a plain storage crate.
+fn worn_palette(db: &Database, record: &Record, opts: &ExportOptions) -> Option<mtl::TintPalette> {
+    let body = opts.body.as_deref()?;
+    let compiled = db
+        .compile_path::<Value>(record.struct_id(), "Components[SGeometryResourceParams]")
+        .ok()?;
+    let components = db.query::<Value>(&compiled, record).ok()?;
+    let entity_name = db.resolve_string2(record.name_offset);
+    let short_name = entity_name.rsplit('.').next().unwrap_or(entity_name).to_lowercase();
+    components
+        .iter()
+        .filter_map(|component| get_value_field(component, "Geometry"))
+        .filter_map(|geometry| get_value_array(geometry, "SubGeometry"))
+        .flatten()
+        .find(|sub| get_value_string(sub, "Tags").is_some_and(|tag| tag.eq_ignore_ascii_case(body)))
+        .and_then(|sub| get_value_field(sub, "Geometry"))
+        .and_then(|geometry| extract_subgeometry_palette(geometry, Some(short_name)))
 }
 
 /// Export an entity payload using pre-resolved geometry/material paths (no DataCore lookup).
@@ -389,7 +570,25 @@ fn load_geometry_parts(
     String,
     Option<String>,
 ), Error> {
-    let resolved = resolve_geometry_files(p4k, geometry_path)?;
+    let mut resolved = resolve_geometry_files(p4k, geometry_path)?;
+    // Skinned, a character's skin is its main part: many weapons list a body on the root bone (CA_BONE, a .cgf)
+    // before the skin of their moving parts (CA_SKIN): the A03 sniper, P6-LR, multitool. As the main part the body
+    // made the export unskinned, and the parts' pieces were merged into it without their bones, so the game's
+    // weapon animations (a barrel sliding out, the multitool's grip unfolding) had nothing to move (2026-10-11)
+    if opts.skinned && resolved.skeleton_path.is_some() {
+        let skin = resolved
+            .parts
+            .iter()
+            .position(|p| p.bone_name.is_none() && p.path.to_ascii_lowercase().ends_with(".skin"));
+        if let Some(i) = skin.filter(|&i| i > 0) {
+            let part = resolved.parts.remove(i);
+            resolved.parts.insert(0, part);
+        }
+    }
+    log::debug!(
+        "geometry parts of {geometry_path}: {:?}",
+        resolved.parts.iter().map(|p| (&p.path, &p.bone_name)).collect::<Vec<_>>()
+    );
     let primary_path = resolved.parts[0].path.clone();
     let skeleton_source_path = skeleton_source_paths(resolved.skeleton_path.as_deref(), &primary_path)
         .first()
@@ -409,28 +608,96 @@ fn load_geometry_parts(
         }
     }
 
-    let effective_material = resolved.parts[0]
-        .material_override
-        .as_deref()
-        .unwrap_or(material_path);
+    // The record's material (the item's own look: a weapon colour variant's, from its geometry's tagged entry)
+    // wins over the one the .cdf names for its part (the model's default material); the .cdf's applies when the
+    // record gives none. The Scourge "Nightstalker" is bspc_fps_apar_scourge_mat_black_02.mtl, its .cdf's part
+    // bspc_fps_apar_scourge_mat.mtl. Until 2026-10-09 the .cdf's always won: 23 of the 7,811 outfit-page exports
+    // with a record material, all weapon colour variants, looked like their base gun (no armor or clothing).
+    let record_material = !material_path.trim().is_empty()
+        && !material_path.trim_end_matches(['/', '\\']).eq_ignore_ascii_case("data");
+    let effective_material = if record_material {
+        material_path
+    } else {
+        resolved.parts[0].material_override.as_deref().unwrap_or(material_path)
+    };
     let (mut mesh, mtl_file, textures, mut nmc) =
         load_single_mesh(p4k, &primary_path, effective_material, opts, png_cache, use_model_bbox)?;
 
-    if nmc.is_none() {
+    // ExportOptions::skinned, for a skin: it stays one mesh in its bind pose, each vertex with its bone weights,
+    // and carries its own bones (its CompiledBones, which the weights' joint numbers point into), in the bind
+    // pose (not the default animation pose). The .cdf parts join it with their own bones, matched by name.
+    let skinned = opts.skinned && mesh.skin.is_some();
+    if skinned {
+        let bones = load_skeleton(p4k, None, &primary_path);
+        if let Some(skin) = mesh.skin.as_mut() {
+            skin.bones = bones;
+        }
+        nmc = None;
+    } else {
+        mesh.skin = None;
+    }
+
+    // The nodes are the skeleton's bones (a skin without a node chunk of its own): its pieces were moved into
+    // their bones' space
+    let mut nodes_are_bones = false;
+    if nmc.is_none() && !skinned {
         nmc = synthesize_nmc_from_bones(&mesh, &skeleton_bones);
         if nmc.is_some() {
             rebase_mesh_submeshes_to_bone_space(&mut mesh, &skeleton_bones);
+            nodes_are_bones = true;
         }
     }
 
-    // Merge additional parts (CA_BONE/CA_SKIN attachments from CDF).
+    // Merge additional parts (CA_BONE/CA_SKIN attachments from CDF). A part's pieces carry node numbers of its
+    // own (a skin's: the bone each rigid piece follows), which mean nothing in the primary's node chunk: read
+    // there, the multitool's `parts.skin` (grip, trigger, wings, canister frame: bones 1 to 13) pointed past the
+    // body's one node and was dropped as helper-less. So a skin over bone nodes has its pieces moved into those
+    // bones' space, like the primary; every other part goes under the primary's root node, as it lies in the
+    // model (a skin in its bind pose, a bone attachment moved by its bone).
     let no_tex_opts = ExportOptions { material_mode: MaterialMode::Colors, ..opts.clone() };
     for part in &resolved.parts[1..] {
         match load_single_mesh(p4k, &part.path, material_path, &no_tex_opts, png_cache, use_model_bbox) {
-            Ok((mut extra_mesh, _, _, _)) => {
-                if let Some(ref bone_name) = part.bone_name {
-                    if let Some(bone) = skeleton_bones.iter().find(|b| b.name.eq_ignore_ascii_case(bone_name)) {
-                        transform_mesh_by_bone(&mut extra_mesh, bone);
+            Ok((mut extra_mesh, _, _, extra_nmc)) => {
+                log::debug!(
+                    "  CDF part '{}': {} vertices, pieces (material, node) {:?}",
+                    part.path,
+                    extra_mesh.positions.len(),
+                    extra_mesh.submeshes.iter().map(|s| (s.material_id, s.node_parent_index)).collect::<Vec<_>>()
+                );
+                let bone = part
+                    .bone_name
+                    .as_ref()
+                    .and_then(|name| skeleton_bones.iter().find(|b| b.name.eq_ignore_ascii_case(name)));
+                // Skinned, a part on a bone becomes one rigid piece of that bone: its own nodes under its root (a
+                // weapon body's display) are applied to its vertices first, as they were when the body was the
+                // main part. Its root's own transform isn't: the Scourge's body.cgf has one, and with it the gun
+                // sat 12 cm off its bones (hangs right without it, as before 2026-10-11)
+                if skinned && bone.is_some() {
+                    extra_mesh = bake_nmc_into_mesh(extra_mesh, extra_nmc.as_ref(), true);
+                }
+                if let Some(bone) = bone {
+                    transform_mesh_by_bone(&mut extra_mesh, bone);
+                }
+                if skinned {
+                    // A skin part brings its own bones; a part on a bone (CA_BONE) follows that bone alone; any
+                    // other the root bone (merge_from)
+                    match (extra_mesh.skin.as_mut(), bone) {
+                        (Some(skin), None) => skin.bones = load_skeleton(p4k, None, &part.path),
+                        (_, Some(bone)) => extra_mesh.skin = Some(crate::types::SkinWeights::rigid(
+                            extra_mesh.positions.len(),
+                            bone.clone(),
+                        )),
+                        (None, None) => {}
+                    }
+                } else {
+                    extra_mesh.skin = None;
+                }
+                if let Some(ref combo) = nmc {
+                    let rebased = part.bone_name.is_none()
+                        && nodes_are_bones
+                        && rebase_mesh_submeshes_to_bone_space(&mut extra_mesh, &skeleton_bones);
+                    if !rebased {
+                        file_under_root_node(&mut extra_mesh, combo);
                     }
                 }
                 mesh.merge_from(extra_mesh);
@@ -631,7 +898,7 @@ pub fn assemble_glb_with_loadout_with_progress(
         root_mesh,
         root_mtl,
         root_tex,
-        _,
+        root_payload_nmc,
         mut root_palette,
         geometry_path,
         material_path,
@@ -644,6 +911,11 @@ pub fn assemble_glb_with_loadout_with_progress(
     }
     let default_root_palette = root_palette.clone();
     log::info!("[mem-pipeline] root exported: {} verts", root_mesh.positions.len());
+    // The mesh's node hierarchy. A skin has none of its own (`resolved.nmc` is None), but its parts that
+    // follow a single bone (armor plates, buckles) were moved into that bone's space when the mesh was
+    // loaded, with a hierarchy built from the skeleton (load_geometry_parts): use that one, or those
+    // parts stay at the origin (on the floor) instead of under their bone.
+    let root_nmc = resolved.nmc.clone().or(root_payload_nmc);
 
     // Check for equipped paint item and resolve its SubGeometry palette/material override.
     let (mut root_palette, root_mtl) = resolve_paint_override(
@@ -908,7 +1180,7 @@ pub fn assemble_glb_with_loadout_with_progress(
                 material_path: material_path.clone(),
                 root_mesh,
                 root_materials: root_mtl,
-                root_nmc: resolved.nmc,
+                root_nmc: root_nmc.clone(),
                 root_palette: root_palette.clone(),
                 available_palettes,
                 root_bones,
@@ -917,6 +1189,7 @@ pub fn assemble_glb_with_loadout_with_progress(
                 children: child_payloads,
                 interiors: loaded_interiors,
                 paint_variants,
+                body: worn_body(db, record, opts),
             },
             opts,
             decomposed_progress.as_ref(),
@@ -942,7 +1215,7 @@ pub fn assemble_glb_with_loadout_with_progress(
             root_mesh: Some(root_mesh),
             root_materials: root_mtl,
             root_textures: root_tex,
-            root_nmc: resolved.nmc,
+            root_nmc,
             root_palette: root_palette.clone(),
             skeleton_bones: root_bones,
             children: child_payloads,
@@ -1111,6 +1384,7 @@ fn empty_child_mesh() -> crate::types::Mesh {
         model_max: [0.0; 3],
         scaling_min: [0.0; 3],
         scaling_max: [0.0; 3],
+        skin: None,
     }
 }
 
@@ -1375,6 +1649,7 @@ pub fn resolve_loadout_meshes(
     let material_path = mtl_compiled
         .and_then(|c| db.query_single::<String>(&c, record).ok().flatten())
         .unwrap_or_default();
+    let (geometry_path, material_path) = worn_geometry(db, record, opts, geometry_path, material_path);
 
     // Load NMC + skeleton from .cga/.chr
     let (nmc, _mtl) = load_nmc_and_material(p4k, &geometry_path, &material_path);
@@ -3604,6 +3879,223 @@ pub(crate) fn load_normal_texture(p4k: &MappedP4k, tif_path: &str, mip_level: u3
     encode_png_rgba(w, h, rgba)
 }
 
+/// Largest mip level kept in the small copy of a block-compressed texture (`TextureFormat::Bc`).
+const LOW_TEXTURE_SIZE: u32 = 256;
+/// zstd level of block-compressed texture files.
+const BC_ZSTD_LEVEL: i32 = 19;
+
+/// A texture for `TextureFormat::Bc`: the full file and its small copy, both DDS compressed with zstd.
+pub(crate) struct BcTexture {
+    pub full: Vec<u8>,
+    pub low: Vec<u8>,
+}
+
+/// A texture as the game stores it, kept block-compressed (see `TextureFormat::Bc`): every mip level
+/// from `mip_level` down. Normal maps (`normal`) get their smoothness merged in, as one BC7.
+/// `None` when the texture is missing or in a format browsers can't read (the caller falls back to PNG).
+pub(crate) fn load_bc_texture(p4k: &MappedP4k, tif_path: &str, mip_level: u32, normal: bool) -> Option<BcTexture> {
+    use starbreaker_dds::DxgiFormat as F;
+    if tif_path.starts_with('$') {
+        return None;
+    }
+    // Same rule as load_normal_texture: only real normal maps
+    let lower = tif_path.to_lowercase();
+    if normal && !lower.contains("_ddna") && !lower.contains("_ddn.") && !lower.contains("_ddn_") {
+        return None;
+    }
+    let dds_path = tif_path
+        .strip_suffix(".tif")
+        .map(|base| format!("{base}.dds"))
+        .unwrap_or_else(|| tif_path.to_string());
+    let p4k_dds_path = datacore_path_to_p4k(&dds_path);
+    let base_bytes = p4k.read(p4k.entry_case_insensitive(&p4k_dds_path)?).ok()?;
+    let sibling_reader = P4kSiblingReader {
+        p4k,
+        base_path: p4k_dds_path,
+    };
+    let dds = DdsFile::from_split(&base_bytes, &sibling_reader).ok()?;
+    if dds.is_cubemap() || dds.mip_count() == 0 {
+        return None;
+    }
+    let format = starbreaker_dds::resolve_format(&dds.header.pixel_format, dds.dxt10_header.as_ref()).ok()?;
+    let first = (mip_level as usize).min(dds.mip_count() - 1);
+
+    let (dxgi, levels) = if normal {
+        (DXGI_BC7_UNORM, encode_normal_smoothness_bc7(&dds, first)?)
+    } else {
+        // The blocks as they are. sRGB or not is left to the reader (it knows which textures are colours).
+        let dxgi = match format {
+            F::BC1Unorm | F::BC1UnormSrgb => 71,
+            F::BC3Unorm | F::BC3UnormSrgb => 77,
+            F::BC4Unorm => 80,
+            F::BC4Snorm => 81,
+            F::BC5Unorm => 83,
+            F::BC5Snorm => 84,
+            F::BC7Unorm | F::BC7UnormSrgb => DXGI_BC7_UNORM,
+            F::BC6hUf16 | F::BC6hSf16 => return None,
+        };
+        // Every level from `first` down, as long as each is whole
+        let levels: Vec<Vec<u8>> = (first..dds.mip_count())
+            .map_while(|level| {
+                let data = &dds.mip_data[level];
+                (data.len() == bc_level_size(format.block_size(), dds.dimensions(level))).then(|| data.clone())
+            })
+            .collect();
+        if levels.is_empty() {
+            return None;
+        }
+        (dxgi, levels)
+    };
+
+    let (width, height) = dds.dimensions(first);
+    let full = write_dds_zstd(dxgi, width, height, &levels)?;
+    // The small copy: the levels of LOW_TEXTURE_SIZE and below (the smallest level if none is)
+    let skip = (0..levels.len())
+        .find(|&i| {
+            let (w, h) = dds.dimensions(first + i);
+            w.max(h) <= LOW_TEXTURE_SIZE
+        })
+        .unwrap_or(levels.len() - 1);
+    let (low_width, low_height) = dds.dimensions(first + skip);
+    let low = write_dds_zstd(dxgi, low_width, low_height, &levels[skip..])?;
+    Some(BcTexture { full, low })
+}
+
+const DXGI_BC7_UNORM: u32 = 98;
+
+/// Bytes of one mip level of a block-compressed texture (4×4 blocks of `block_size` bytes).
+fn bc_level_size(block_size: usize, (width, height): (u32, u32)) -> usize {
+    width.div_ceil(4) as usize * height.div_ceil(4) as usize * block_size
+}
+
+/// A normal map and its smoothness (which the game keeps in separate "attached alpha" files) as one BC7
+/// texture per mip level: normal X in red, Y in green, smoothness in alpha. Blue is left at 0: Z is
+/// rebuilt from X and Y by the reader, so BC7 spends its precision on X and Y. The game's own levels are
+/// decoded and re-encoded; a level without its smoothness file gets the one above it, halved.
+fn encode_normal_smoothness_bc7(dds: &DdsFile, first: usize) -> Option<Vec<Vec<u8>>> {
+    let mut levels = Vec::new();
+    let mut previous: Option<((u32, u32), Vec<u8>)> = None;
+    for level in first..dds.mip_count() {
+        let (w, h) = dds.dimensions(level);
+        let Ok(mut rgba) = dds.decode_rgba(level) else { break };
+        if rgba.len() != (w * h * 4) as usize {
+            break;
+        }
+        let smoothness = smoothness_level(dds, w, h)
+            .or_else(|| previous.as_ref().map(|(size, s)| halve(s, *size, (w, h))));
+        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+            px[2] = 0;
+            px[3] = smoothness.as_ref().map_or(255, |s| s[i]);
+        }
+        if let Some(s) = smoothness {
+            previous = Some(((w, h), s));
+        }
+        levels.push(encode_bc7(&rgba, w, h));
+    }
+    (!levels.is_empty()).then_some(levels)
+}
+
+/// The smoothness of a `w`×`h` level, from the attached alpha file of that size (BC4: 8 bytes a block).
+/// Matched by size: the files don't always line up with the colour levels one for one.
+fn smoothness_level(dds: &DdsFile, w: u32, h: u32) -> Option<Vec<u8>> {
+    let size = bc_level_size(8, (w, h));
+    let data = dds.alpha_mip_data.iter().find(|d| d.len() == size)?;
+    let rgba = starbreaker_dds::decode::decode_block_compressed(data, w, h, starbreaker_dds::decode::BlockFormat::BC4, false).ok()?;
+    Some(rgba.iter().step_by(4).copied().collect())
+}
+
+/// A one-channel image at half size (2×2 average), for a mip level without its own data.
+fn halve(src: &[u8], (sw, sh): (u32, u32), (w, h): (u32, u32)) -> Vec<u8> {
+    let mut out = vec![0u8; (w * h) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let (x0, y0) = ((x * 2).min(sw - 1), (y * 2).min(sh - 1));
+            let (x1, y1) = ((x0 + 1).min(sw - 1), (y0 + 1).min(sh - 1));
+            let at = |x: u32, y: u32| src[(y * sw + x) as usize] as u32;
+            out[(y * w + x) as usize] = ((at(x0, y0) + at(x1, y0) + at(x0, y1) + at(x1, y1) + 2) / 4) as u8;
+        }
+    }
+    out
+}
+
+/// BC7-encode an RGBA image (Intel's ISPC encoder), in strips of block rows side by side.
+fn encode_bc7(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    use rayon::prelude::*;
+    // The encoder works on whole 4×4 blocks: pad by repeating the last row / column
+    let (pw, ph) = (w.div_ceil(4) * 4, h.div_ceil(4) * 4);
+    let padded: std::borrow::Cow<[u8]> = if (pw, ph) == (w, h) {
+        std::borrow::Cow::Borrowed(rgba)
+    } else {
+        let mut out = vec![0u8; (pw * ph * 4) as usize];
+        for y in 0..ph {
+            for x in 0..pw {
+                let src = ((y.min(h - 1) * w + x.min(w - 1)) * 4) as usize;
+                let dst = ((y * pw + x) * 4) as usize;
+                out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+            }
+        }
+        std::borrow::Cow::Owned(out)
+    };
+    let settings = intel_tex_2::bc7::alpha_basic_settings();
+    const STRIP: u32 = 64;
+    (0..ph.div_ceil(STRIP))
+        .into_par_iter()
+        .map(|strip| {
+            let y0 = strip * STRIP;
+            let rows = STRIP.min(ph - y0);
+            let start = (y0 * pw * 4) as usize;
+            let surface = intel_tex_2::RgbaSurface {
+                data: &padded[start..start + (rows * pw * 4) as usize],
+                width: pw,
+                height: rows,
+                stride: pw * 4,
+            };
+            intel_tex_2::bc7::compress_blocks(&settings, &surface)
+        })
+        .collect::<Vec<_>>()
+        .concat()
+}
+
+/// A DDS file (DX10 header, `dxgi` format, the given mip levels largest first), compressed with zstd.
+fn write_dds_zstd(dxgi: u32, width: u32, height: u32, levels: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(148 + levels.iter().map(Vec::len).sum::<usize>());
+    bytes.extend_from_slice(b"DDS ");
+    let mut put = |v: u32| bytes.extend_from_slice(&v.to_le_bytes());
+    // DDS_HEADER: size, flags (caps, height, width, pixel format, mip count, linear size)
+    put(124);
+    put(0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | 0x80000);
+    put(height);
+    put(width);
+    put(levels[0].len() as u32);
+    put(0); // depth
+    put(levels.len() as u32);
+    for _ in 0..11 {
+        put(0);
+    }
+    // DDS_PIXELFORMAT: size, flags (FourCC), "DX10", then no bit counts / masks
+    put(32);
+    put(0x4);
+    put(u32::from_le_bytes(*b"DX10"));
+    for _ in 0..5 {
+        put(0);
+    }
+    // caps (texture, + mipmap and complex when there are several levels), caps2-4, reserved
+    put(0x1000 | if levels.len() > 1 { 0x400000 | 0x8 } else { 0 });
+    for _ in 0..4 {
+        put(0);
+    }
+    // DDS_HEADER_DXT10: format, 2D texture, no flags, one element, alpha mode unknown
+    put(dxgi);
+    put(3);
+    put(0);
+    put(1);
+    put(0);
+    for level in levels {
+        bytes.extend_from_slice(level);
+    }
+    zstd::bulk::compress(&bytes, BC_ZSTD_LEVEL).ok()
+}
+
 /// Extract per-pixel roughness from the alpha mips of a _ddna normal map DDS.
 ///
 /// CryEngine stores smoothness in separate sibling files (.7a, .6a, ...) as BC4 compressed.
@@ -3659,7 +4151,21 @@ pub(crate) fn load_roughness_texture(p4k: &MappedP4k, tif_path: &str, mip_level:
 }
 
 /// Resolve the MTL file path in P4k format from a MtlName string.
+///
+/// Most meshes store the name without its extension, some with it
+/// (`Objects/.../m_srvl_combat_medium_legs_01_01.mtl`): don't add a second `.mtl`.
 fn resolve_mtl_p4k_path(mtl_name: &str, p4k_geom_path: &str) -> String {
+    let mtl_name = match mtl_name.len().checked_sub(4) {
+        Some(i) if mtl_name.is_char_boundary(i) && mtl_name[i..].eq_ignore_ascii_case(".mtl") => &mtl_name[..i],
+        _ => mtl_name,
+    };
+    // A path is from Data\ (Objects/...); a few names include it already (the Wrecker armor's .skin names
+    // Data/Objects/.../m_srvl_combat_heavy_core_03_01.mtl), which came out as Data\Data\..., not found: the
+    // item had no material at all (until 2026-10-09)
+    let mtl_name = match mtl_name.get(..5) {
+        Some(head) if head.eq_ignore_ascii_case("data/") || head.eq_ignore_ascii_case("data\\") => &mtl_name[5..],
+        _ => mtl_name,
+    };
     if mtl_name.contains('/') || mtl_name.contains('\\') {
         format!("Data\\{}.mtl", mtl_name.replace('/', "\\"))
     } else {
@@ -3756,7 +4262,30 @@ fn resolve_material(
     let metadata = metadata_bytes?;
     let mtl_name = mtl::extract_mtl_name(metadata)?;
     let mtl_p4k_path = resolve_mtl_p4k_path(&mtl_name, p4k_geom_path);
-    try_load_mtl(p4k, &mtl_p4k_path)
+    try_load_mtl(p4k, &mtl_p4k_path).or_else(|| {
+        // 3. A bare name that isn't next to the mesh: the same folder of the other base body. The female EVL
+        // glasses' f_evl_glasses_01.skin (female_v2\...\terra_cc\) names m_evl_glasses_01_01_01, which is
+        // only in male_v7\...\terra_cc\; the item had no material at all (until 2026-10-09)
+        if mtl_name.contains('/') || mtl_name.contains('\\') {
+            return None;
+        }
+        let other = other_body_path(&mtl_p4k_path)?;
+        let mtl = try_load_mtl(p4k, &other)?;
+        log::info!("material {mtl_name} not next to {p4k_geom_path}: taken from {other}");
+        Some(mtl)
+    })
+}
+
+/// The same p4k path in the other base body's folders (`\male_v7\` and `\female_v2\` swapped), None when it's in
+/// neither.
+fn other_body_path(p4k_path: &str) -> Option<String> {
+    let lower = p4k_path.to_ascii_lowercase();
+    for (from, to) in [("\\female_v2\\", "\\male_v7\\"), ("\\male_v7\\", "\\female_v2\\")] {
+        if let Some(i) = lower.find(from) {
+            return Some(format!("{}{to}{}", &p4k_path[..i], &p4k_path[i + from.len()..]));
+        }
+    }
+    None
 }
 
 /// Resolve paint-based palette and material overrides from an equipped paint item.
@@ -4212,7 +4741,8 @@ fn extract_subgeometry_palette(
         primary: read_entry("entryA"),
         secondary: read_entry("entryB"),
         tertiary: read_entry("entryC"),
-        glass: read_entry("glassColor"),
+        // glassColor is a plain colour, not an entry with a tintColor like entryA/B/C
+        glass: read_rgb_value_field(root, "glassColor").unwrap_or_else(|| read_entry("glassColor")),
         decal_color_r: read_rgb_value_field(root, "decalColorR"),
         decal_color_g: read_rgb_value_field(root, "decalColorG"),
         decal_color_b: read_rgb_value_field(root, "decalColorB"),
@@ -4514,7 +5044,8 @@ fn query_tint_from_path(
         primary: query_rgb("entryA"),
         secondary: query_rgb("entryB"),
         tertiary: query_rgb("entryC"),
-        glass: query_rgb("glassColor"),
+        // glassColor is a plain colour, not an entry with a tintColor like entryA/B/C
+        glass: query_palette_rgb("glassColor").unwrap_or_else(|| query_rgb("glassColor")),
         decal_color_r: query_palette_rgb("decalColorR"),
         decal_color_g: query_palette_rgb("decalColorG"),
         decal_color_b: query_palette_rgb("decalColorB"),
@@ -4706,6 +5237,37 @@ fn transform_mesh_by_bone(mesh: &mut crate::Mesh, bone: &crate::skeleton::Bone) 
     mesh.model_max = new_max.into();
 }
 
+/// Put every piece of a mesh lying in model space under the root node of a node chunk: the glTF writer reads a
+/// piece's vertices in its node's space, so they're moved by the inverse of the root's transform (most roots
+/// are the identity).
+fn file_under_root_node(mesh: &mut crate::Mesh, combo: &crate::nmc::NodeMeshCombo) {
+    let Some(root) = combo.nodes.iter().position(|node| node.parent_index.is_none()) else {
+        return;
+    };
+    let m = combo.nodes[root].bone_to_world;
+    let to_world = glam::Mat4::from_cols(
+        glam::Vec4::new(m[0][0], m[1][0], m[2][0], 0.0),
+        glam::Vec4::new(m[0][1], m[1][1], m[2][1], 0.0),
+        glam::Vec4::new(m[0][2], m[1][2], m[2][2], 0.0),
+        glam::Vec4::new(m[0][3], m[1][3], m[2][3], 1.0),
+    );
+    if to_world.determinant().abs() > 1e-6 && !to_world.abs_diff_eq(glam::Mat4::IDENTITY, 1e-5) {
+        let to_root = to_world.inverse();
+        let to_root3 = glam::Mat3::from_mat4(to_root);
+        for p in &mut mesh.positions {
+            *p = to_root.transform_point3(glam::Vec3::from(*p)).into();
+        }
+        if let Some(ref mut normals) = mesh.normals {
+            for n in normals {
+                *n = (to_root3 * glam::Vec3::from(*n)).normalize_or_zero().into();
+            }
+        }
+    }
+    for submesh in &mut mesh.submeshes {
+        submesh.node_parent_index = root as u16;
+    }
+}
+
 fn rebase_mesh_submeshes_to_bone_space(
     mesh: &mut crate::Mesh,
     bones: &[crate::skeleton::Bone],
@@ -4892,6 +5454,7 @@ fn resolve_geometry_files(
     let root = xml.root();
     let mut parts = Vec::new();
     let mut skeleton_path = None;
+    let mut model_mesh = None;
 
     for child in xml.node_children(root) {
         if xml.node_tag(child) == "Model" {
@@ -4899,7 +5462,22 @@ fn resolve_geometry_files(
                 xml.node_attributes(child).collect();
             if let Some(&file) = attrs.get("File") {
                 if !file.is_empty() {
-                    skeleton_path = Some(file.to_string());
+                    // The model is usually the skeleton (.chr) the attachments hang on. It can also be a mesh
+                    // (.cga, .cgf, .skin): the character is then that mesh, and its attachments may be only
+                    // sockets without geometry. The Hedeby rifle (hdgw_rifle_ballistic_01.cdf, 4.10.2 PTU
+                    // 12878398) is its .cga and an empty CA_BONE "bullet", and failed with "has no attachments".
+                    if is_mesh_file(file) {
+                        model_mesh = Some(GeometryPart {
+                            path: file.to_string(),
+                            bone_name: None,
+                            material_override: attrs
+                                .get("Material")
+                                .filter(|s| !s.is_empty())
+                                .map(|s| with_mtl_extension(s)),
+                        });
+                    } else {
+                        skeleton_path = Some(file.to_string());
+                    }
                 }
             }
         }
@@ -4928,6 +5506,11 @@ fn resolve_geometry_files(
         }
     }
 
+    // A mesh model is the main part, before the attachments
+    if let Some(mesh) = model_mesh {
+        parts.insert(0, mesh);
+    }
+
     if parts.is_empty() {
         return Err(Error::Other(format!(
             "CDF {geometry_path} has no attachments"
@@ -4938,6 +5521,21 @@ fn resolve_geometry_files(
         parts,
         skeleton_path,
     })
+}
+
+/// A geometry file (a mesh), as opposed to a skeleton (.chr): what a CDF's Model can be besides a skeleton.
+fn is_mesh_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [".cga", ".cgf", ".skin"].iter().any(|ext| lower.ends_with(ext))
+}
+
+/// A CDF's Model material can be given without its extension ("..._mat"), unlike its attachments' ("..._mat.mtl").
+fn with_mtl_extension(path: &str) -> String {
+    if path.to_ascii_lowercase().ends_with(".mtl") {
+        path.to_string()
+    } else {
+        format!("{path}.mtl")
+    }
 }
 
 /// Load a single mesh file from the P4k, with LOD resolution and material/NMC/texture loading.
@@ -5627,6 +6225,38 @@ pub fn dump_hierarchy(
 mod tests {
     use super::*;
 
+    #[test]
+    fn body_variant_finds_a_body_nested_under_another_tag() {
+        let v = |tag: &str, path: &str| starbreaker_datacore::loadout::SubGeometryVariant {
+            tag: tag.into(),
+            geometry_path: path.into(),
+            material_path: String::new(),
+        };
+        let necksock = vec![
+            v("headwear female nodna", "f.skin"),
+            v("headwear male nodna", "m.skin"),
+            v("headwear male short", "m_short.skin"),
+            v("headwear male short nodna", "m_short.skin"),
+        ];
+        assert_eq!(body_variant(necksock.clone(), "Male").unwrap().geometry_path, "m.skin");
+        assert_eq!(body_variant(necksock, "female").unwrap().geometry_path, "f.skin");
+        // the entry tagged with the body alone wins
+        let armor = vec![v("male extra", "a.skin"), v("Male", "b.skin")];
+        assert_eq!(body_variant(armor, "male").unwrap().geometry_path, "b.skin");
+        assert!(body_variant(vec![v("female", "f.skin")], "male").is_none());
+        let necksock = vec![
+            v("headwear male nodna", "m.skin"),
+            v("headwear male short", "m_short.skin"),
+            v("headwear male short nodna", "m_short.skin"),
+        ];
+        assert_eq!(body_variant(necksock, "male short").unwrap().geometry_path, "m_short.skin");
+        let mut nodna = v("headwear female short nodna", "f_short.skin");
+        nodna.material_path = "m_universal_necksock_01.mtl".into();
+        let female = vec![v("headwear female short", "f_short.skin"), nodna];
+        let chosen = body_variant(female, "female short").unwrap();
+        assert_eq!((chosen.geometry_path.as_str(), chosen.material_path.as_str()), ("f_short.skin", "m_universal_necksock_01.mtl"));
+    }
+
     use starbreaker_datacore::types::{CigGuid, StringId, StringId2};
 
     fn sample_export_result(kind: ExportKind, glb: Vec<u8>) -> ExportResult {
@@ -5692,6 +6322,7 @@ mod tests {
                 first_vertex: (index as u32) * 3,
                 num_vertices: 3,
                 node_parent_index: *node_parent_index,
+                zone: None,
             })
             .collect();
 
@@ -5708,6 +6339,7 @@ mod tests {
             model_max: [0.0; 3],
             scaling_min: [0.0; 3],
             scaling_max: [0.0; 3],
+            skin: None,
         }
     }
 
@@ -5782,6 +6414,7 @@ mod tests {
                     first_vertex: 0,
                     num_vertices: 3,
                     node_parent_index: 0,
+                    zone: None,
                 },
                 crate::types::SubMesh {
                     material_name: None,
@@ -5791,12 +6424,14 @@ mod tests {
                     first_vertex: 3,
                     num_vertices: 3,
                     node_parent_index: 1,
+                    zone: None,
                 },
             ],
             model_min: [2.0, 0.0, 0.0],
             model_max: [6.0, 5.0, 0.0],
             scaling_min: [2.0, 0.0, 0.0],
             scaling_max: [6.0, 5.0, 0.0],
+            skin: None,
         };
         let bones = vec![
             sample_bone("root", None, [2.0, 0.0, 0.0], [2.0, 0.0, 0.0]),
@@ -5810,6 +6445,32 @@ mod tests {
         assert_eq!(mesh.positions[3], [0.0, 0.0, 0.0]);
         assert_eq!(mesh.positions[4], [1.0, 0.0, 0.0]);
         assert_eq!(mesh.positions[5], [0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn cdf_part_pieces_go_under_the_primary_root_node() {
+        // The multitool: its `parts.skin` (bind pose, pieces numbered by the bone they follow: 0 and 5 here)
+        // merged into a body whose node chunk has other nodes. The pieces go under the root, in its space.
+        let mut mesh = sample_mesh(&[0, 5]);
+        mesh.positions = vec![[2.0, 0.0, 0.0]; mesh.positions.len()];
+        let node = |name: &str, parent: Option<u16>, tx: f32| crate::nmc::NmcNode {
+            name: name.into(),
+            parent_index: parent,
+            world_to_bone: [[1.0, 0.0, 0.0, -tx], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+            bone_to_world: [[1.0, 0.0, 0.0, tx], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+            scale: [1.0, 1.0, 1.0],
+            geometry_type: 0,
+            properties: std::collections::HashMap::new(),
+        };
+        let combo = crate::nmc::NodeMeshCombo {
+            nodes: vec![node("hatch", Some(1), 0.0), node("body", None, 0.5)],
+            material_indices: vec![0, 0],
+        };
+
+        file_under_root_node(&mut mesh, &combo);
+
+        assert!(mesh.submeshes.iter().all(|s| s.node_parent_index == 1), "the root is node 1");
+        assert!(mesh.positions.iter().all(|p| (p[0] - 1.5).abs() < 1e-6), "moved into the root's space");
     }
 
     #[test]
@@ -5918,6 +6579,80 @@ mod tests {
     }
 
     #[test]
+    fn resolve_mtl_p4k_path_name_with_data_prefix() {
+        // The Wrecker core's .skin names its material with Data/ in front: not Data\Data\...
+        assert_eq!(
+            resolve_mtl_p4k_path(
+                "Data/Objects/Characters/Human/male_v7/armor/srvl/m_srvl_combat_heavy_core_03_01.mtl",
+                "Data\\Objects\\Characters\\Human\\male_v7\\armor\\srvl\\m_srvl_combat_heavy_core_03.skin"
+            ),
+            "Data\\Objects\\Characters\\Human\\male_v7\\armor\\srvl\\m_srvl_combat_heavy_core_03_01.mtl"
+        );
+    }
+
+    #[test]
+    fn other_body_path_swaps_the_body_folder() {
+        // The female EVL glasses' material is only in the male folder
+        assert_eq!(
+            other_body_path("Data\\Objects\\Characters\\Human\\female_v2\\clothing\\terra_cc\\m_evl_glasses_01_01_01.mtl").as_deref(),
+            Some("Data\\Objects\\Characters\\Human\\male_v7\\clothing\\terra_cc\\m_evl_glasses_01_01_01.mtl")
+        );
+        assert_eq!(
+            other_body_path("Data\\Objects\\Characters\\Human\\Male_V7\\clothing\\x.mtl").as_deref(),
+            Some("Data\\Objects\\Characters\\Human\\female_v2\\clothing\\x.mtl")
+        );
+        assert_eq!(other_body_path("Data\\Objects\\fps_weapons\\x.mtl"), None);
+    }
+
+    #[test]
+    fn bc_dds_file_reads_back() {
+        // Two BC4 levels (8 x 8 and 4 x 4): 4 blocks, then 1, of 8 bytes
+        let levels = vec![(0u8..32).collect::<Vec<u8>>(), vec![7u8; 8]];
+        let packed = write_dds_zstd(80, 8, 8, &levels).unwrap();
+        let bytes = zstd::bulk::decompress(&packed, 1 << 20).unwrap();
+        assert_eq!(&bytes[..4], b"DDS ");
+        assert_eq!(bytes.len(), 148 + 40);
+        let dds = DdsFile::from_bytes(&bytes).unwrap();
+        assert_eq!(dds.dimensions(0), (8, 8));
+        assert_eq!(dds.mip_count(), 2);
+        assert_eq!(dds.mip_data, levels);
+        assert_eq!(
+            starbreaker_dds::resolve_format(&dds.header.pixel_format, dds.dxt10_header.as_ref()).unwrap(),
+            starbreaker_dds::DxgiFormat::BC4Unorm
+        );
+    }
+
+    #[test]
+    fn halve_averages_2x2() {
+        let src = [0u8, 100, 200, 255, 0, 100, 200, 255];
+        assert_eq!(halve(&src, (4, 2), (2, 1)), vec![50, 228]);
+        // 1-pixel-wide sources repeat their edge
+        assert_eq!(halve(&[10, 30], (1, 2), (1, 1)), vec![20]);
+    }
+
+    #[test]
+    fn bc7_encodes_whole_blocks_of_any_size() {
+        let rgba = vec![128u8; 6 * 3 * 4];
+        assert_eq!(encode_bc7(&rgba, 6, 3).len(), 2 * 16);
+        assert_eq!(encode_bc7(&vec![128u8; 4], 1, 1).len(), 16);
+    }
+
+    #[test]
+    fn resolve_mtl_p4k_path_with_extension() {
+        assert_eq!(
+            resolve_mtl_p4k_path(
+                "Objects/Characters/Human/male_v7/armor/srvl/m_srvl_combat_medium_legs_01_01.mtl",
+                "Data\\Objects\\Characters\\Human\\male_v7\\armor\\srvl\\m_srvl_combat_medium_legs_01.skin"
+            ),
+            "Data\\Objects\\Characters\\Human\\male_v7\\armor\\srvl\\m_srvl_combat_medium_legs_01_01.mtl"
+        );
+        assert_eq!(
+            resolve_mtl_p4k_path("teapot.MTL", "Data\\objects\\default\\teapot.cgf"),
+            "Data\\objects\\default\\teapot.mtl"
+        );
+    }
+
+    #[test]
     fn resolve_mtl_p4k_path_short_name() {
         assert_eq!(
             resolve_mtl_p4k_path("teapot", "Data\\objects\\default\\teapot.cgf"),
@@ -5952,6 +6687,17 @@ mod tests {
             skeleton_source_paths(None, "Data/Objects/Ships/Test/gear.skin"),
             vec!["Data/Objects/Ships/Test/gear.skin"]
         );
+    }
+
+    #[test]
+    fn cdf_model_mesh_files_and_material_extension() {
+        // A CDF Model that's a mesh is loaded as the main part (the Hedeby rifle's .cga), a .chr is the skeleton
+        assert!(is_mesh_file("objects/fps_weapons/weapons_v7/hdgw/rifle/ballistic_01/hdgw_rifle_ballistic_01.cga"));
+        assert!(is_mesh_file("Objects/Test/part.CGF"));
+        assert!(is_mesh_file("objects/test/body.skin"));
+        assert!(!is_mesh_file("objects/fps_weapons/weapons_v7/hdgw/pistol/salvo/bpst_fps_hdgw_salvo.chr"));
+        assert_eq!(with_mtl_extension("objects/test/gun_mat"), "objects/test/gun_mat.mtl");
+        assert_eq!(with_mtl_extension("objects/test/gun_mat.MTL"), "objects/test/gun_mat.MTL");
     }
 
     #[test]

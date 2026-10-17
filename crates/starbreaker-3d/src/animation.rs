@@ -29,6 +29,8 @@ use crate::error::Error;
 
 pub mod dba;
 mod dba_tracks;
+#[cfg(test)]
+mod aim_tests;
 
 // ── Public types ────────────────────────────────────────────────────────────
 
@@ -45,6 +47,12 @@ pub struct AnimationClip {
     pub name: String,
     /// Frames per second (from metadata, default 30).
     pub fps: f32,
+    /// An additive clip: each key is a change on top of the pose under it (a rotation multiplied in front, a
+    /// position added), not the bone's value. Bit 0 of the clip's flags (a `.caf`'s ANIM_INFO, a `.dba` entry's
+    /// flags1): set on 164 of the 165 player `_add` clips of 4.10.2 and on none of their plain poses; a weapon's
+    /// ammo pose can be one (the P6-LR's: zero positions, which as values would put its bolt and magazine on
+    /// its origin).
+    pub additive: bool,
     /// Per-bone animation channels.
     pub channels: Vec<BoneChannel>,
 }
@@ -101,6 +109,8 @@ struct ControllerEntry {
 #[derive(Debug)]
 #[allow(dead_code)]
 struct DbaMetaEntry {
+    /// The clip's flags, as a `.caf`'s ANIM_INFO starts with (bit 0: additive)
+    flags1: u32,
     fps: u16,
     /// Expected number of bone controllers in the matching block.
     num_controllers: u16,
@@ -123,6 +133,11 @@ mod chunk_types {
     pub const DBA_META: u32 = 0xF7351608; // IvoDBAMetadata
     pub const CAF_DATA: u32 = 0xA9496CB5; // IvoCAFData
     pub const ANIM_INFO: u32 = 0x4733C6ED; // IvoAnimInfo
+    // `.aim` (aim pose) files hold one clip like a `.caf` (one frame per aim direction), under these two
+    // ids: the clip block ('#caf') and the first 16 bytes of an ANIM_INFO (fps at byte 4). The chunk
+    // registry knows the same values as BSHAPES / SKELETON, from other file types.
+    pub const AIM_DATA: u32 = 0xF5C6EB5B;
+    pub const AIM_INFO: u32 = 0x1BBC4103;
 }
 
 // ── Parsing entry points ────────────────────────────────────────────────────
@@ -179,6 +194,7 @@ fn match_dba_metadata_to_blocks(
             .map(|(i, channels)| AnimationClip {
                 name: format!("anim_{i}"),
                 fps: 30.0,
+                additive: false,
                 channels,
             })
             .collect();
@@ -197,6 +213,7 @@ fn match_dba_metadata_to_blocks(
     // fall back to a positional name so the clip is still exported.
     let mut clips: Vec<AnimationClip> = Vec::with_capacity(blocks.len());
     for (i, channels) in blocks.into_iter().enumerate() {
+        let additive = meta_entries.get(i).is_some_and(|(_, meta)| meta.flags1 & 1 != 0);
         let (name, fps) = match meta_entries.get(i) {
             Some((name, meta)) => {
                 if (meta.num_controllers as usize) != channels.len() {
@@ -217,13 +234,14 @@ fn match_dba_metadata_to_blocks(
             }
             None => (format!("anim_{i}"), 30.0),
         };
-        clips.push(AnimationClip { name, fps, channels });
+        clips.push(AnimationClip { name, fps, additive, channels });
     }
     clips
 }
 
 
-/// Parse a `.caf` file from raw bytes.
+/// Parse a `.caf` file from raw bytes. Also reads `.aim` aim-pose files: the same single clip under the
+/// AIM_* chunk ids.
 pub fn parse_caf(data: &[u8]) -> Result<AnimationDatabase, Error> {
     let chunk_file = ChunkFile::from_bytes(data)?;
     let ivo = match &chunk_file {
@@ -234,14 +252,15 @@ pub fn parse_caf(data: &[u8]) -> Result<AnimationDatabase, Error> {
     let anim_info = ivo
         .chunks()
         .iter()
-        .find(|c| c.chunk_type == chunk_types::ANIM_INFO)
+        .find(|c| c.chunk_type == chunk_types::ANIM_INFO || c.chunk_type == chunk_types::AIM_INFO)
         .map(|c| parse_anim_info(ivo.chunk_data(c)));
-    let fps = anim_info.map(|i| i.fps as f32).unwrap_or(30.0);
+    let fps = anim_info.as_ref().map(|i| i.fps as f32).unwrap_or(30.0);
+    let additive = anim_info.is_some_and(|i| i.flags & 1 != 0);
 
     let caf_chunk = ivo
         .chunks()
         .iter()
-        .find(|c| c.chunk_type == chunk_types::CAF_DATA)
+        .find(|c| c.chunk_type == chunk_types::CAF_DATA || c.chunk_type == chunk_types::AIM_DATA)
         .ok_or_else(|| Error::Other("No CAF data chunk found".into()))?;
 
     let data_bytes = ivo.chunk_data(caf_chunk);
@@ -253,6 +272,7 @@ pub fn parse_caf(data: &[u8]) -> Result<AnimationDatabase, Error> {
         .map(|(i, channels)| AnimationClip {
             name: format!("clip_{i}"),
             fps,
+            additive,
             channels,
         })
         .collect();
@@ -489,6 +509,7 @@ fn parse_dba_metadata(data: &[u8]) -> Vec<(String, DbaMetaEntry)> {
             f32::from_le_bytes(data[o + 44..o + 48].try_into().unwrap_or([0; 4])),
         ];
         entries.push(DbaMetaEntry {
+            flags1: u32::from_le_bytes([data[o + 4], data[o + 5], data[o + 6], data[o + 7]]),
             fps,
             num_controllers,
             end_frame,
@@ -526,16 +547,50 @@ fn parse_dba_metadata(data: &[u8]) -> Vec<(String, DbaMetaEntry)> {
 }
 
 struct AnimInfo {
+    /// The clip's flags (bit 0: additive)
+    flags: u32,
     fps: u16,
 }
 
 fn parse_anim_info(data: &[u8]) -> AnimInfo {
     AnimInfo {
+        flags: if data.len() >= 4 { u32::from_le_bytes([data[0], data[1], data[2], data[3]]) } else { 0 },
         fps: if data.len() >= 6 {
             u16::from_le_bytes([data[4], data[5]])
         } else {
             30
         },
+    }
+}
+
+#[cfg(test)]
+mod additive_flag_tests {
+    use super::*;
+
+    /// A `.caf`'s ANIM_INFO as the P6-LR's ammo pose starts: flags 3 (additive), 30 fps, 25 controllers
+    #[test]
+    fn caf_anim_info_bit_0_is_additive() {
+        let info = parse_anim_info(&[3, 0, 0, 0, 30, 0, 25, 0, 0, 0, 9, 0]);
+        assert_eq!(info.flags & 1, 1);
+        assert_eq!(info.fps, 30);
+        assert_eq!(parse_anim_info(&[2, 0, 0, 0, 30, 0, 6, 0]).flags & 1, 0);
+    }
+
+    /// A `.dba` entry has the same flags 4 bytes in (flags1), before its fps; the clip built from it says so
+    #[test]
+    fn dba_entry_flags1_marks_the_clip_additive() {
+        let mut data = vec![2, 0, 0, 0];
+        for flags1 in [1u32, 2] {
+            let mut entry = vec![0u8; 48];
+            entry[4..8].copy_from_slice(&flags1.to_le_bytes());
+            entry[8..10].copy_from_slice(&30u16.to_le_bytes());
+            data.extend(entry);
+        }
+        data.extend(b"pose_add\0pose\0");
+        let meta = parse_dba_metadata(&data);
+        assert_eq!(meta.iter().map(|(n, m)| (n.as_str(), m.flags1)).collect::<Vec<_>>(), [("pose_add", 1), ("pose", 2)]);
+        let clips = match_dba_metadata_to_blocks(vec![vec![], vec![]], &meta);
+        assert_eq!(clips.iter().map(|c| c.additive).collect::<Vec<_>>(), [true, false]);
     }
 }
 
@@ -1449,6 +1504,7 @@ pub fn dump_database_to_json(
             "index": idx,
             "name": clip.name,
             "fps": clip.fps,
+            "additive": clip.additive,
             "channel_count": clip.channels.len(),
             "frame_count": frame_count,
             "channels": channels_out,
@@ -2108,6 +2164,7 @@ fn caf_anchored_remap(
             named_clips.push(AnimationClip {
                 name: event_name.clone(),
                 fps: db.clips[idx].fps,
+                additive: db.clips[idx].additive,
                 channels: db.clips[idx].channels.clone(),
             });
         } else {
@@ -2514,6 +2571,7 @@ mod bake_tests {
         let clip = AnimationClip {
             name: "test_clip".to_string(),
             fps: 30.0,
+            additive: false,
             channels: vec![BoneChannel {
                 bone_hash: 0xDEADBEEF,
                 rotations: vec![],
@@ -2543,6 +2601,7 @@ mod bake_tests {
         let clip = AnimationClip {
             name: "timed_clip".to_string(),
             fps: 30.0,
+            additive: false,
             channels: vec![BoneChannel {
                 bone_hash: 0xDEADBEEF,
                 rotations: vec![Keyframe {
@@ -2594,6 +2653,7 @@ mod bake_tests {
         let clip = AnimationClip {
             name: "landing_gear_extend".to_string(),
             fps: 30.0,
+            additive: false,
             channels: vec![BoneChannel {
                 bone_hash: 0xCAFEBABE,
                 rotations: vec![Keyframe { time: 0.0, value: [0.0, 0.0, 0.0, 1.0] }],
@@ -2636,6 +2696,7 @@ mod bake_tests {
         let clips = vec![AnimationClip {
             name: "deploy".to_string(),
             fps: 30.0,
+            additive: false,
             channels: vec![
                 BoneChannel {
                     bone_hash: additive_hash,
@@ -2812,6 +2873,7 @@ mod bake_tests {
             clips: vec![AnimationClip {
                 name: "wings_deploy".to_string(),
                 fps: 30.0,
+                additive: false,
                 channels: vec![
                     make_ch(wing_left_hash),
                     make_ch(wing_right_hash),

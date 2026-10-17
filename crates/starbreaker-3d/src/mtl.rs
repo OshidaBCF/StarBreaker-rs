@@ -515,12 +515,11 @@ impl SubMaterial {
         if self.is_nodraw {
             return AlphaConfig::Blend;
         }
-        let mask = &self.string_gen_mask;
         // Decals use alpha blending for layering on top of hull geometry.
         // MeshDecal shader is always a decal overlay, even without %DECAL flag.
         // Note: STENCIL_MAP on non-MeshDecal shaders (e.g. HardSurface camo paints)
         // is for the stencil pattern system, NOT alpha blending — don't treat as decal.
-        if mask.contains("%DECAL") || self.shader == "MeshDecal" {
+        if self.is_decal() {
             return AlphaConfig::Blend;
         }
         if self.alpha_test > 0.0 {
@@ -537,9 +536,10 @@ impl SubMaterial {
     }
 
     /// Whether this material is a decal overlay (needs alpha texture to look correct).
+    /// Matches the %DECAL flag exactly: LayerBlend's %DECALS only means the surface
+    /// can carry a decal sheet (armor, hulls), it is not a decal itself.
     pub fn is_decal(&self) -> bool {
-        let mask = &self.string_gen_mask;
-        mask.contains("%DECAL") || self.shader == "MeshDecal"
+        self.decoded_string_gen_mask().has_decal || self.shader == "MeshDecal"
     }
 
     /// Whether this material uses a glass shader (GlassPBR).
@@ -605,8 +605,14 @@ impl SubMaterial {
     /// multiplier. If EmissiveColor is non-zero, the material intends to emit light.
     /// GlowAmount defaults to 0 when absent from the MTL, but materials that set
     /// EmissiveColor without explicit GlowAmount still expect to glow (at full intensity).
+    /// Except plain white: "1,1,1" without GlowAmount is the editor's default value, carried
+    /// by thousands of non-glowing LayerBlend / Illum / HardSurface materials (armor plates...),
+    /// while real glows without GlowAmount (thrusters, glow trims) author a colour.
     pub fn emissive_factor(&self) -> [f32; 3] {
         let e = &self.emissive;
+        if self.glow <= 0.0 && *e == [1.0, 1.0, 1.0] {
+            return [0.0, 0.0, 0.0];
+        }
         if e[0] > 0.0 || e[1] > 0.0 || e[2] > 0.0 {
             let g = if self.glow > 0.0 { self.glow } else { 1.0 };
             [e[0] * g, e[1] * g, e[2] * g]
@@ -616,8 +622,7 @@ impl SubMaterial {
     }
 
     pub fn is_double_sided(&self) -> bool {
-        let mask = &self.string_gen_mask;
-        mask.contains("%DECAL") || self.shader == "MeshDecal"
+        self.is_decal()
     }
 }
 
@@ -1143,6 +1148,33 @@ mod tests {
             authored_textures: Vec::new(),
             authored_child_blocks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn decals_flag_is_not_a_decal() {
+        // Armor plates: %DECALS = "can carry a decal sheet", must stay opaque and single-sided
+        let plate = dummy_submaterial("LayerBlend_V2", "%NORMAL_MAP%BLEND_MAP%DECALS");
+        assert!(!plate.is_decal());
+        assert!(!plate.is_double_sided());
+        assert!(matches!(plate.alpha_config(), AlphaConfig::Opaque));
+
+        let decal = dummy_submaterial("Illum", "%DECAL%NORMAL_MAP");
+        assert!(decal.is_decal());
+        assert!(matches!(decal.alpha_config(), AlphaConfig::Blend));
+    }
+
+    #[test]
+    fn white_emissive_without_glow_does_not_glow() {
+        let mut plate = dummy_submaterial("LayerBlend_V2", "");
+        plate.emissive = [1.0, 1.0, 1.0];
+        assert_eq!(plate.emissive_factor(), [0.0, 0.0, 0.0]);
+
+        plate.glow = 0.5; // an explicit GlowAmount still glows
+        assert_eq!(plate.emissive_factor(), [0.5, 0.5, 0.5]);
+
+        let mut thruster = dummy_submaterial("HardSurface", "");
+        thruster.emissive = [0.0, 0.05, 0.13]; // a coloured glow without GlowAmount: full intensity
+        assert_eq!(thruster.emissive_factor(), [0.0, 0.05, 0.13]);
     }
 
     #[test]

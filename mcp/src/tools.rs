@@ -812,13 +812,14 @@ impl StarBreakerMcp {
         out
     }
 
-    #[tool(description = "Inspect a CryEngine animation database (.dba) or compressed animation file (.caf). Returns structured JSON: clip metadata (name, fps, frame_count, channel_count) and per-channel bone hashes plus first/last keyframe samples (or full keyframe arrays with all_keyframes=true). Provide `skeleton` to resolve bone hashes to names — accepts either a CHR skeleton (CompiledBones) or a CGA/CGAM scene graph (NMC nodes) for ships whose main body has no CHR; combine with `bone_filter` to drill down to a small set of channels (e.g. wings, landing gear). Use `filter` for clip-name filtering. Replaces the legacy `starbreaker dba dump` CLI.")]
+    #[tool(description = "Inspect a CryEngine animation database (.dba), compressed animation file (.caf) or aim pose (.aim, one clip like a .caf). Returns structured JSON: clip metadata (name, fps, frame_count, channel_count) and per-channel bone hashes plus first/last keyframe samples (or full keyframe arrays with all_keyframes=true). Provide `skeleton` to resolve bone hashes to names — accepts either a CHR skeleton (CompiledBones) or a CGA/CGAM scene graph (NMC nodes) for ships whose main body has no CHR; combine with `bone_filter` to drill down to a small set of channels (e.g. wings, landing gear). Use `filter` for clip-name filtering. Replaces the legacy `starbreaker dba dump` CLI.")]
     fn dba_dump(&self, Parameters(req): Parameters<DbaDumpRequest>) -> String {
         let bytes = match self.read_p4k_or_disk(&req.path) {
             Ok(b) => b,
             Err(e) => return e,
         };
-        let db = if req.path.to_ascii_lowercase().ends_with(".caf") {
+        let lower = req.path.to_ascii_lowercase();
+        let db = if lower.ends_with(".caf") || lower.ends_with(".aim") {
             match starbreaker_3d::animation::parse_caf(&bytes) {
                 Ok(db) => db,
                 Err(e) => return format!("parse_caf failed for {}: {e}", req.path),

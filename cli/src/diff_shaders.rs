@@ -178,3 +178,14 @@ pub fn export(p4k: &MappedP4k, output: &Path, previous: Option<&FileIndex>, curr
 #[cfg(test)]
 #[path = "diff_shaders_tests.rs"]
 mod tests;
+
+/// `starbreaker shaders`: only the readable shader sources, without a whole diff snapshot.
+pub fn export_sources(p4k_path: Option<&Path>, output: &Path) -> Result<()> {
+    let p4k = crate::common::load_p4k(p4k_path)?;
+    let root = output.join("ShaderSources");
+    for entry in p4k.entries().iter().filter(|entry| is_shader_archive(&entry.name)) {
+        let (count, unresolved) = with_archive(&p4k, entry, |archive| export_archive(&root, &entry.name, archive))?;
+        eprintln!("[SHADERS] {}: {count} readable files, {} unresolved token IDs", entry.name, unresolved.len());
+    }
+    Ok(())
+}

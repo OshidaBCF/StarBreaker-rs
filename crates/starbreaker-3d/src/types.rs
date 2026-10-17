@@ -19,6 +19,52 @@ pub struct Mesh {
     /// Scaling bounding box (second bbox from MeshInfo, used for dequantization).
     pub scaling_min: [f32; 3],
     pub scaling_max: [f32; 3],
+    /// Skinning (a `.skin`'s bone map): which bones move each vertex, for exports that keep the mesh
+    /// deformable (`ExportOptions::skinned`). None for static meshes.
+    pub skin: Option<SkinWeights>,
+}
+
+/// Per-vertex skinning of a mesh: up to 4 bones per vertex as indices into `bones`, with weights summing to
+/// 1. `bones` is the skin's own bone list (its CompiledBones, in their order: what the vertices' joint indices
+/// point into), with their bind pose in model space; empty until the skeleton is attached.
+#[derive(Debug, Clone, Default)]
+pub struct SkinWeights {
+    pub joints: Vec<[u16; 4]>,
+    pub weights: Vec<[f32; 4]>,
+    pub bones: Vec<crate::skeleton::Bone>,
+}
+
+impl SkinWeights {
+    /// From a skin's bone map (weights 0-255): normalized to sum 1; a vertex without weights follows joint 0.
+    pub fn from_bone_maps(maps: &[crate::ivo::skin::BoneMap12]) -> Self {
+        let mut joints = Vec::with_capacity(maps.len());
+        let mut weights = Vec::with_capacity(maps.len());
+        for m in maps {
+            let total: f32 = m.weights.iter().map(|&w| w as f32).sum();
+            if total <= 0.0 {
+                joints.push([0, 0, 0, 0]);
+                weights.push([1.0, 0.0, 0.0, 0.0]);
+                continue;
+            }
+            let mut j = [0u16; 4];
+            let mut w = [0f32; 4];
+            for k in 0..4 {
+                // an unused slot points at joint 0 with weight 0
+                if m.weights[k] > 0 {
+                    j[k] = m.joint_indices[k];
+                    w[k] = m.weights[k] as f32 / total;
+                }
+            }
+            joints.push(j);
+            weights.push(w);
+        }
+        Self { joints, weights, bones: Vec::new() }
+    }
+
+    /// Every one of `vertices` following `bone` alone (a rigid part attached to a bone).
+    pub fn rigid(vertices: usize, bone: crate::skeleton::Bone) -> Self {
+        Self { joints: vec![[0; 4]; vertices], weights: vec![[1.0, 0.0, 0.0, 0.0]; vertices], bones: vec![bone] }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +76,10 @@ pub struct SubMesh {
     pub first_vertex: u32,
     pub num_vertices: u32,
     pub node_parent_index: u16,
+    /// The zone this piece belongs to, as the 32-bit hash a `.skin` keeps for it (its "extra words", which
+    /// `node_parent_index` points into): the body's `l_hand_zone`, a helmet's optional `theta_head_zone`
+    /// piece... Character items show or hide pieces by zone. None for meshes without zones.
+    pub zone: Option<u32>,
 }
 
 impl Mesh {
@@ -37,6 +87,43 @@ impl Mesh {
     pub fn merge_from(&mut self, other: Mesh) {
         let vertex_offset = self.positions.len() as u32;
         let index_offset = self.indices.len() as u32;
+
+        // Skins: one bone list for both, by name; the other's joint indices remapped into it. A side without a
+        // skin follows bone 0 (the root) at full weight.
+        match (&mut self.skin, other.skin) {
+            (Some(a), Some(b)) => {
+                let remap: Vec<u16> = b
+                    .bones
+                    .iter()
+                    .map(|bone| {
+                        match a.bones.iter().position(|x| x.name.eq_ignore_ascii_case(&bone.name)) {
+                            Some(i) => i as u16,
+                            None => {
+                                a.bones.push(bone.clone());
+                                (a.bones.len() - 1) as u16
+                            }
+                        }
+                    })
+                    .collect();
+                a.joints.extend(b.joints.iter().map(|j| j.map(|i| remap.get(i as usize).copied().unwrap_or(0))));
+                a.weights.extend(b.weights);
+            }
+            (Some(a), None) => {
+                a.joints.resize(vertex_offset as usize + other.positions.len(), [0; 4]);
+                a.weights.resize(vertex_offset as usize + other.positions.len(), [1.0, 0.0, 0.0, 0.0]);
+            }
+            (None, Some(b)) => {
+                let mut s = SkinWeights {
+                    joints: vec![[0; 4]; vertex_offset as usize],
+                    weights: vec![[1.0, 0.0, 0.0, 0.0]; vertex_offset as usize],
+                    bones: b.bones.clone(),
+                };
+                s.joints.extend(b.joints);
+                s.weights.extend(b.weights);
+                self.skin = Some(s);
+            }
+            (None, None) => {}
+        }
 
         self.positions.extend(other.positions);
         match (&mut self.uvs, other.uvs) {
@@ -284,6 +371,11 @@ pub fn build_mesh_with_bbox(skin: &SkinMesh, materials: &[MaterialName], use_mod
             .collect()
     });
 
+    // In a skin with zones (extra words), a submesh's node_parent_index says which zone it's in, not which bone
+    // it hangs from: keep the zone and start it at the root bone (split_rigid_weighted_submeshes below moves
+    // rigid pieces to their real bone). Read as a bone, a zone index filed pieces under unrelated bones (a
+    // Greycat core under World, Hips, LeftUpLeg... by zone order).
+    let has_zones = !skin.extra_words.is_empty();
     let submeshes = skin
         .submeshes
         .iter()
@@ -294,7 +386,8 @@ pub fn build_mesh_with_bbox(skin: &SkinMesh, materials: &[MaterialName], use_mod
             num_indices: s.num_indices,
             first_vertex: s.first_vertex,
             num_vertices: s.page_base,
-            node_parent_index: s.node_parent_index,
+            node_parent_index: if has_zones { 0 } else { s.node_parent_index },
+            zone: skin.extra_words.get(s.node_parent_index as usize).copied(),
         })
         .collect::<Vec<_>>();
 
@@ -355,6 +448,14 @@ pub fn build_mesh_with_bbox(skin: &SkinMesh, materials: &[MaterialName], use_mod
     let tangents_out: Option<Vec<[f32; 4]>> =
         tangent_decode.map(|td| td.iter().map(|nt| nt.tangent).collect());
 
+    // The bone map, one entry per vertex (the bones are attached by whoever reads the skin's skeleton)
+    let skin_weights = skin
+        .streams
+        .bone_maps
+        .as_deref()
+        .filter(|maps| maps.len() == positions.len())
+        .map(SkinWeights::from_bone_maps);
+
     Mesh {
         positions,
         indices,
@@ -368,6 +469,7 @@ pub fn build_mesh_with_bbox(skin: &SkinMesh, materials: &[MaterialName], use_mod
         model_max: skin.info.model_max,
         scaling_min: skin.info.min_bound,
         scaling_max: skin.info.max_bound,
+        skin: skin_weights,
     }
 }
 
@@ -622,6 +724,65 @@ mod tests {
     use super::*;
     use crate::ivo::skin::{BoneMap12, DataStreams, MeshInfo, SubMeshDescriptor};
 
+    fn named_bone(name: &str) -> crate::skeleton::Bone {
+        crate::skeleton::Bone {
+            name: name.into(),
+            parent_index: None,
+            object_node_index: None,
+            local_position: [0.0; 3],
+            local_rotation: [1.0, 0.0, 0.0, 0.0],
+            world_position: [0.0; 3],
+            world_rotation: [1.0, 0.0, 0.0, 0.0],
+        }
+    }
+
+    fn skinned_triangle(bones: &[&str], joints: [u16; 4], weights: [f32; 4]) -> Mesh {
+        Mesh {
+            positions: vec![[0.0; 3]; 3],
+            indices: vec![0, 1, 2],
+            uvs: None,
+            secondary_uvs: None,
+            normals: None,
+            tangents: None,
+            colors: None,
+            submeshes: Vec::new(),
+            model_min: [0.0; 3],
+            model_max: [0.0; 3],
+            scaling_min: [0.0; 3],
+            scaling_max: [0.0; 3],
+            skin: Some(SkinWeights {
+                joints: vec![joints; 3],
+                weights: vec![weights; 3],
+                bones: bones.iter().map(|n| named_bone(n)).collect(),
+            }),
+        }
+    }
+
+    #[test]
+    fn bone_map_weights_are_normalized_and_unused_slots_point_at_joint_0() {
+        let maps = [
+            BoneMap12 { joint_indices: [5, 7, 9, 11], weights: [191, 64, 0, 0] },
+            BoneMap12 { joint_indices: [3, 0, 0, 0], weights: [0, 0, 0, 0] },
+        ];
+        let skin = SkinWeights::from_bone_maps(&maps);
+        assert_eq!(skin.joints[0], [5, 7, 0, 0]);
+        assert!((skin.weights[0][0] - 191.0 / 255.0).abs() < 1e-6 && (skin.weights[0][1] - 64.0 / 255.0).abs() < 1e-6);
+        assert_eq!(skin.weights[1], [1.0, 0.0, 0.0, 0.0], "a vertex without weights follows joint 0");
+    }
+
+    #[test]
+    fn merging_skins_remaps_joints_by_bone_name() {
+        // a body part's skin (World, Hips, Spine) and another's (World, Spine, Neck): Spine is one bone
+        let mut a = skinned_triangle(&["World", "Hips", "Spine"], [2, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]);
+        let b = skinned_triangle(&["World", "Spine", "Neck"], [1, 2, 0, 0], [0.5, 0.5, 0.0, 0.0]);
+        a.merge_from(b);
+        let skin = a.skin.unwrap();
+        let names: Vec<&str> = skin.bones.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["World", "Hips", "Spine", "Neck"]);
+        assert_eq!(skin.joints[3], [2, 3, 0, 0], "Spine and Neck in the merged list");
+        assert_eq!(skin.joints.len(), 6);
+    }
+
     #[test]
     fn build_mesh_from_synthetic_skin() {
         let skin = SkinMesh {
@@ -692,6 +853,57 @@ mod tests {
         assert_eq!(secondary_uvs[0], [0.5, 0.0]);
         assert_eq!(secondary_uvs[1], [0.0, 0.5]);
         assert_eq!(secondary_uvs[2], [1.0, 0.0]);
+    }
+
+    #[test]
+    fn build_mesh_reads_zones_and_keeps_zoned_pieces_on_the_root_bone() {
+        // Two pieces in two zones: node_parent_index points into extra_words (the zone hashes), not at a bone
+        let descriptor = |node_parent_index: u16, first_index: u32| SubMeshDescriptor {
+            mat_id: 0,
+            node_parent_index,
+            first_index,
+            num_indices: 3,
+            first_vertex: 0,
+            page_base: 0,
+            num_vertices: 3,
+            radius: 5.0,
+            center: [5.0, 5.0, 5.0],
+            unknown0: 0,
+            unknown1: 0,
+        };
+        let skin = SkinMesh {
+            flags: 0,
+            info: MeshInfo {
+                flags2: 5,
+                num_vertices: 3,
+                num_indices: 6,
+                num_submeshes: 2,
+                model_min: [0.0, 0.0, 0.0],
+                model_max: [10.0, 10.0, 10.0],
+                min_bound: [0.0, 0.0, 0.0],
+                max_bound: [10.0, 10.0, 10.0],
+                extra_count: 2,
+            },
+            submeshes: vec![descriptor(0, 0), descriptor(1, 3)],
+            extra_words: vec![3530000764, 2583318635],
+            streams: DataStreams {
+                positions: PositionData::Quantized(vec![[0, 0, 0], [100, 0, 0], [0, 100, 0]]),
+                uvs: Vec::new(),
+                secondary_uvs: None,
+                indices: vec![0, 1, 2, 0, 2, 1],
+                bone_maps: None,
+                colors: None,
+                tangents: None,
+                normals: None,
+            },
+        };
+
+        let mesh = build_mesh(&skin, &[MaterialName { name: "m".into() }]);
+
+        assert_eq!(mesh.submeshes.len(), 2);
+        assert_eq!(mesh.submeshes[0].zone, Some(3530000764));
+        assert_eq!(mesh.submeshes[1].zone, Some(2583318635));
+        assert!(mesh.submeshes.iter().all(|s| s.node_parent_index == 0));
     }
 
     #[test]

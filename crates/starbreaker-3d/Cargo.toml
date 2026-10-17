@@ -20,6 +20,8 @@ rayon = "1.11.0"
 log = "0.4"
 glam = "0.29"
 crc32fast = "1.4"
+zstd = "0.13"
+intel_tex_2 = "0.5"
 
 [dev-dependencies]
 env_logger = "0.11"

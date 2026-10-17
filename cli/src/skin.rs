@@ -19,6 +19,9 @@ pub enum SkinCommand {
         /// Path to Data.p4k
         #[arg(long, env = "SC_DATA_P4K")]
         p4k: Option<PathBuf>,
+        /// Keep the bone weights, with the skeleton of the matching .skin as joints: an animatable mesh
+        #[arg(long)]
+        skinned: bool,
     },
     /// Inspect a .skinm/.skin/.cgfm/.chr file and print parsed metadata
     Inspect {
@@ -52,7 +55,7 @@ pub enum SkinCommand {
 impl SkinCommand {
     pub fn run(self) -> Result<()> {
         match self {
-            Self::Export { path, output, p4k } => export(path, output, p4k),
+            Self::Export { path, output, p4k, skinned } => export(path, output, p4k, skinned),
             Self::Inspect { path, p4k, bone_weights } => inspect(path, p4k, bone_weights),
             Self::ScanStreams { p4k } => scan_streams(p4k),
             Self::FindStream { stream_id, p4k } => find_stream(stream_id, p4k),
@@ -292,7 +295,7 @@ fn find_stream(stream_id_hex: String, p4k_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn export(search: String, output: Option<PathBuf>, p4k_path: Option<PathBuf>) -> Result<()> {
+fn export(search: String, output: Option<PathBuf>, p4k_path: Option<PathBuf>, skinned: bool) -> Result<()> {
     let p4k = load_p4k(p4k_path.as_deref())?;
     let search_lower = search.to_lowercase();
 
@@ -307,7 +310,17 @@ fn export(search: String, output: Option<PathBuf>, p4k_path: Option<PathBuf>) ->
 
     eprintln!("Found: {}", entry.name);
     let data = p4k.read(entry)?;
-    let glb = starbreaker_3d::skin_to_glb(&data, None)?;
+    let glb = if skinned {
+        // the skeleton: the .skin next to the .skinm (its CompiledBones, which the weights point into)
+        let skeleton_name = entry.name.strip_suffix('m').unwrap_or(&entry.name).to_string();
+        let skeleton = p4k
+            .entry_case_insensitive(&skeleton_name)
+            .ok_or_else(|| CliError::NotFound(format!("no skeleton file {skeleton_name}")))?;
+        let skeleton_data = p4k.read(skeleton)?;
+        starbreaker_3d::skin_to_glb_with(&data, Some(&skeleton_data), true)?
+    } else {
+        starbreaker_3d::skin_to_glb(&data, None)?
+    };
 
     let output = output.unwrap_or_else(|| {
         let stem = entry.name.rsplit(['/', '\\']).next().unwrap_or("output");

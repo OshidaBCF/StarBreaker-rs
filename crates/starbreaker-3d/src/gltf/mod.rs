@@ -168,11 +168,27 @@ pub fn write_glb_with_progress(
     progress: Option<&Progress>,
 ) -> Result<Vec<u8>, Error> {
     let mut builder = GlbBuilder::new();
+    // A skinned root mesh (ExportOptions::skinned): its skin goes on the root mesh node, its joints the bone
+    // nodes (the skin's own bones when no skeleton is given). Only for a single flat mesh node, not an NMC
+    // hierarchy (which moves pieces into node space).
+    let root_skin = input
+        .root_mesh
+        .as_ref()
+        .and_then(|m| m.skin.clone())
+        .filter(|s| !s.bones.is_empty() && input.root_nmc.as_ref().is_none_or(|n| n.nodes.is_empty()));
+    let skeleton_bones = match &root_skin {
+        Some(skin) if input.skeleton_bones.is_empty() => skin.bones.clone(),
+        _ => input.skeleton_bones.clone(),
+    };
 
     log::info!("[mem-phase] start write_glb");
     report_progress(progress, 0.05, "Packing root mesh");
     // ---- Pack root entity (drop textures after packing) ----
-    let mut scene_nodes = if let Some(root_mesh) = input.root_mesh {
+    let mut scene_nodes = if let Some(mut root_mesh) = input.root_mesh {
+        // Weights with no skin to bind them (the mesh is laid out by its node chunk): leave them out
+        if root_skin.is_none() {
+            root_mesh.skin = None;
+        }
         let root_packed = builder.pack_mesh(
             &root_mesh,
             input.root_materials.as_ref(),
@@ -206,8 +222,11 @@ pub fn write_glb_with_progress(
     log::info!("[mem-phase] root packed, bin={}MB", builder.bin.len() / 1_048_576);
     report_progress(progress, 0.20, "Packing child meshes");
     // ---- Skeleton bone nodes ----
-    if !hierarchy_covers_bones(input.root_nmc.as_ref(), &input.skeleton_bones) {
-        builder.attach_skeleton_bones(&input.skeleton_bones, &scene_nodes);
+    if !hierarchy_covers_bones(input.root_nmc.as_ref(), &skeleton_bones) {
+        builder.attach_skeleton_bones(&skeleton_bones, &scene_nodes);
+    }
+    if let (Some(skin), Some(mesh_node)) = (root_skin.as_ref(), scene_nodes.first()) {
+        builder.attach_skin(skin, mesh_node.value() as u32, &scene_nodes);
     }
 
     // ---- Attach child entities ----
@@ -319,11 +338,13 @@ mod tests {
                 first_vertex: 0,
                 num_vertices: 3,
                 node_parent_index: 0,
+                zone: None,
             }],
             model_min: [0.0; 3],
             model_max: [1.0; 3],
             scaling_min: [0.0; 3],
             scaling_max: [1.0; 3],
+            skin: None,
         }
     }
 
@@ -2086,6 +2107,7 @@ mod tests {
             model_max: [3.0, 1.0, 0.0],
             scaling_min: [0.0; 3],
             scaling_max: [3.0, 1.0, 0.0],
+            skin: None,
             submeshes: vec![
                 SubMesh {
                     material_name: Some("mat_a".into()),
@@ -2095,6 +2117,7 @@ mod tests {
                     first_vertex: 0,
                     num_vertices: 3,
                     node_parent_index: 0, // belongs to root node
+                    zone: None,
                 },
                 SubMesh {
                     material_name: Some("mat_b".into()),
@@ -2104,6 +2127,7 @@ mod tests {
                     first_vertex: 3,
                     num_vertices: 3,
                     node_parent_index: 1, // belongs to child node
+                    zone: None,
                 },
             ],
         };
@@ -2212,6 +2236,7 @@ mod tests {
             model_max: [1.0; 3],
             scaling_min: [0.0; 3],
             scaling_max: [1.0; 3],
+            skin: None,
             submeshes: vec![SubMesh {
                 material_name: None,
                 material_id: 0,
@@ -2220,6 +2245,7 @@ mod tests {
                 first_vertex: 0,
                 num_vertices: 3,
                 node_parent_index: 1,
+                zone: None,
             }],
         };
 

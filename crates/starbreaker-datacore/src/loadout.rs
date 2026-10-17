@@ -134,39 +134,44 @@ impl<'a> EntityIndex<'a> {
     /// Query SubGeometry variants from an entity's SGeometryResourceParams.
     /// Returns tagged geometry variants (e.g., "right" -> Right.cga, "left" -> Left.cga).
     pub fn query_sub_geometry(&self, record: &Record) -> Vec<SubGeometryVariant> {
-        // Query the full SGeometryResourceParams component, then walk to SubGeometry.
-        // Querying just ".Geometry" may truncate the SubGeometry array.
-        let compiled = match self.db.compile_path::<Value>(
-            record.struct_id(),
-            "Components[SGeometryResourceParams]",
-        ) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
+        query_sub_geometry_variants(self.db, record)
+    }
+}
 
-        let components = match self.db.query::<Value>(&compiled, record) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
+/// Same as `EntityIndex::query_sub_geometry`, for callers that only have the database.
+pub fn query_sub_geometry_variants(db: &Database, record: &Record) -> Vec<SubGeometryVariant> {
+    // Query the full SGeometryResourceParams component, then walk to SubGeometry.
+    // Querying just ".Geometry" may truncate the SubGeometry array.
+    let compiled = match db.compile_path::<Value>(
+        record.struct_id(),
+        "Components[SGeometryResourceParams]",
+    ) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
 
-        let mut variants = Vec::new();
-        for component in &components {
-            let geom_node = match get_object_field(component, "Geometry") {
-                Some(g) => g,
-                None => {
-                    log::debug!("    no Geometry field in component");
-                    continue;
-                }
-            };
-            let sub_arr = get_array_field(geom_node, "SubGeometry");
-            if let Some(sub_geom_arr) = sub_arr {
-                for sub in sub_geom_arr {
-                    collect_sub_geometry_variants(sub, &[], &mut variants);
-                }
+    let components = match db.query::<Value>(&compiled, record) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut variants = Vec::new();
+    for component in &components {
+        let geom_node = match get_object_field(component, "Geometry") {
+            Some(g) => g,
+            None => {
+                log::debug!("    no Geometry field in component");
+                continue;
+            }
+        };
+        let sub_arr = get_array_field(geom_node, "SubGeometry");
+        if let Some(sub_geom_arr) = sub_arr {
+            for sub in sub_geom_arr {
+                collect_sub_geometry_variants(sub, &[], &mut variants);
             }
         }
-        variants
     }
+    variants
 }
 
 /// Extract a string field from a Value::Object.
@@ -412,7 +417,16 @@ fn resolve_sub_geometry(idx: &EntityIndex, children: &mut [LoadoutNode]) {
             child.geometry_path = Some(m.geometry_path.clone());
             if !m.material_path.is_empty() { child.material_path = Some(m.material_path.clone()); }
         } else if variants.len() > 1 {
-            if has_multiple_geometry_variants(&variants) {
+            if !has_multiple_geometry_variants(&carried_variants(&variants)) {
+                // Only state variants besides one model at most (a magazine's "tableDisplay" and "empty"):
+                // the child is the item as carried, its own geometry (the full magazine in a weapon)
+                log::debug!(
+                    "  SubGeometry: {} has only state variants ({}); keeping default geometry {}",
+                    child.entity_name,
+                    variants.iter().map(|v| v.tag.as_str()).collect::<Vec<_>>().join(", "),
+                    child.geometry_path.as_deref().unwrap_or("")
+                );
+            } else if has_multiple_geometry_variants(&variants) {
                 log::warn!(
                     "  SubGeometry: {} has {} variants but none matched port='{}' bone='{}' tags='{}'. Variants: [{}]",
                     child.entity_name, variants.len(), child.item_port_name,
@@ -442,7 +456,7 @@ fn resolve_sub_geometry(idx: &EntityIndex, children: &mut [LoadoutNode]) {
             .filter(|(j, c)| *j != ui && c.entity_name == entity)
             .filter_map(|(_, c)| c.geometry_path.clone())
             .collect();
-        if let Some(v) = variants.iter().find(|v| !claimed.contains(&v.geometry_path)) {
+        if let Some(v) = carried_variants(&variants).into_iter().find(|v| !claimed.contains(&v.geometry_path)) {
             log::info!("  SubGeometry: {} tag='{}' (fallback, unclaimed) -> {}", entity, v.tag, v.geometry_path);
             children[ui].geometry_path = Some(v.geometry_path.clone());
             if !v.material_path.is_empty() { children[ui].material_path = Some(v.material_path.clone()); }
@@ -453,6 +467,20 @@ fn resolve_sub_geometry(idx: &EntityIndex, children: &mut [LoadoutNode]) {
     for child in children.iter_mut() {
         resolve_sub_geometry(idx, &mut child.children);
     }
+}
+
+/// The variants that are the item as carried or mounted: without those showing it in another state, on a
+/// shop's display table ("tableDisplay", "tableDisplay2") or empty (a magazine's "empty"). Picked as a
+/// fallback, those put a display model or an empty magazine in a weapon.
+fn carried_variants(variants: &[SubGeometryVariant]) -> Vec<SubGeometryVariant> {
+    variants
+        .iter()
+        .filter(|v| {
+            let tag = v.tag.to_ascii_lowercase();
+            !tag.starts_with("tabledisplay") && tag != "empty"
+        })
+        .cloned()
+        .collect()
 }
 
 fn has_multiple_geometry_variants(variants: &[SubGeometryVariant]) -> bool {
@@ -837,6 +865,26 @@ mod tests {
         ];
 
         assert!(!has_multiple_geometry_variants(&variants));
+    }
+
+    #[test]
+    fn state_variants_are_not_carried_variants() {
+        // A magazine in a weapon: its SubGeometry has only the shop display and empty models, neither the
+        // magazine as carried (its own geometry)
+        let variant = |tag: &str, geometry_path: &str| SubGeometryVariant {
+            tag: tag.to_string(),
+            geometry_path: geometry_path.to_string(),
+            material_path: String::new(),
+        };
+        let magazine = vec![
+            variant("tableDisplay", "Objects/fps_weapons/attachments/magazines/apar/mgzn_s05_apar_20sb_01_25_25_25_c.cgf"),
+            variant("empty", "Objects/fps_weapons/attachments/magazines/apar/mgzn_s05_apar_20sb_01_empty.cgf"),
+        ];
+        assert!(carried_variants(&magazine).is_empty());
+        assert!(!has_multiple_geometry_variants(&carried_variants(&magazine)));
+
+        let sides = vec![variant("left", "a_left.cgf"), variant("right", "a_right.cgf"), variant("TableDisplay2", "a_display.cgf")];
+        assert_eq!(carried_variants(&sides).iter().map(|v| v.tag.as_str()).collect::<Vec<_>>(), vec!["left", "right"]);
     }
 }
 

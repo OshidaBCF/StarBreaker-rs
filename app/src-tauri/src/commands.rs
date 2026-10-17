@@ -617,7 +617,7 @@ fn collect_existing_decomposed_assets(output_root: &Path) -> Result<HashSet<Stri
             let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
                 continue;
             };
-            if !matches!(extension, "glb" | "png") {
+            if !matches!(extension, "glb" | "png" | "zst") {
                 continue;
             }
 
@@ -726,10 +726,15 @@ pub async fn start_export(
         include_nodraw: request.include_nodraw,
         include_shields: false,
         texture_mip: request.mip,
+        texture_format: starbreaker_3d::TextureFormat::Png,
         lod_level: request.lod,
         include_animations: request.include_animations,
         apply_default_animation_pose: !request.include_animations,
         default_animation_tags: vec!["landing_gear_extend".to_string()],
+        body: Some("Male".to_string()),
+        overrides: None,
+        keep_material_slots: false,
+        skinned: false,
     };
 
     log::info!(

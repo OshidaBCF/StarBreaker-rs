@@ -12,7 +12,7 @@ use crate::nmc::NodeMeshCombo;
 use crate::pipeline::{
     DecomposedExport, ExportOptions, ExportedFile, ExportedFileKind, InteriorCgfEntry,
     LoadedInteriors, MaterialMode,
-    PngCache,
+    PngCache, TextureFormat,
 };
 use crate::skeleton::Bone;
 use crate::types::{EntityPayload, Mesh};
@@ -33,6 +33,15 @@ pub(crate) struct DecomposedInput {
     pub interiors: LoadedInteriors,
     /// All available paint variants for this entity, populated from SubGeometry entries.
     pub paint_variants: Vec<crate::mtl::PaintVariant>,
+    /// Wearables: the body whose worn model this is ("male", "female"), `None` for everything else.
+    /// Goes into the package name, so both bodies' exports can share one export root (and its Data/).
+    pub body: Option<String>,
+}
+
+/// Textures already made during one export, and the format they're written in.
+pub(crate) struct TextureStore {
+    cache: PngCache,
+    format: TextureFormat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -127,6 +136,7 @@ fn empty_scene_graph_mesh() -> Mesh {
         model_max: [0.0; 3],
         scaling_min: [0.0; 3],
         scaling_max: [0.0; 3],
+        skin: None,
     }
 }
 
@@ -325,10 +335,11 @@ fn clean_export_label(name: &str) -> String {
     }
 }
 
-fn package_directory_name(entity_name: &str, lod: u32, mip: u32) -> String {
+fn package_directory_name(entity_name: &str, body: Option<&str>, lod: u32, mip: u32) -> String {
     format!(
-        "{}_LOD{}_TEX{}",
+        "{}{}_LOD{}_TEX{}",
         clean_export_label(export_entity_basename(entity_name)),
+        body.map(|b| format!("_{}", b.to_ascii_lowercase())).unwrap_or_default(),
         lod,
         mip,
     )
@@ -344,6 +355,7 @@ fn build_decomposed_material_view(
     nmc: Option<&NodeMeshCombo>,
     include_nodraw: bool,
     include_shields: bool,
+    keep_material_slots: bool,
 ) -> DecomposedMaterialView {
     let Some(materials) = materials else {
         let filtered_mesh = filter_mesh_geometry(mesh, None, nmc, include_nodraw, include_shields);
@@ -355,6 +367,20 @@ fn build_decomposed_material_view(
             glb_nmc: filtered_nmc,
         };
     };
+
+    // ExportOptions::keep_material_slots: the material file decides nothing about the mesh (only the mesh's own
+    // helper pieces, named proxy / nodraw, are left out), and the mesh file carries no materials: each piece
+    // keeps its own slot (glb primitive extras "slot") and the reader takes its material from the sidecar
+    if keep_material_slots {
+        let filtered_mesh = filter_mesh_geometry(mesh, None, nmc, include_nodraw, include_shields);
+        let (filtered_mesh, filtered_nmc) = filter_nmc_hierarchy(filtered_mesh, nmc, include_nodraw, include_shields);
+        return DecomposedMaterialView {
+            mesh: filtered_mesh,
+            sidecar_materials: Some(materials.clone()),
+            glb_materials: None,
+            glb_nmc: filtered_nmc,
+        };
+    }
 
     if include_nodraw {
         let filtered_mesh = filter_mesh_geometry(mesh, Some(materials), nmc, include_nodraw, include_shields);
@@ -487,6 +513,11 @@ fn filter_nmc_hierarchy(
     let Some(nmc) = nmc else {
         return (mesh, None);
     };
+    // A node chunk without nodes (the multitool's battery, gdgt_fps_grin_multitool_battery.cgf) names no helper:
+    // nothing to leave out. Read as a hierarchy, no piece would have a node and all of them went.
+    if nmc.nodes.is_empty() {
+        return (mesh, None);
+    }
 
     let excluded_nodes = nmc
         .nodes
@@ -589,10 +620,10 @@ pub(crate) fn write_decomposed_export(
 ) -> Result<DecomposedExport, Error> {
     let mut files = BTreeMap::new();
     let mut texture_cache: HashMap<(String, TextureFlavor), String> = HashMap::new();
-    let mut png_cache = PngCache::new();
+    let mut png_cache = TextureStore { cache: PngCache::new(), format: opts.texture_format };
     let mut palette_records = BTreeMap::new();
     let mut livery_usage = BTreeMap::new();
-    let package_name = package_directory_name(&input.entity_name, opts.lod_level, opts.texture_mip);
+    let package_name = package_directory_name(&input.entity_name, input.body.as_deref(), opts.lod_level, opts.texture_mip);
     let scene_manifest_path = package_relative_path(&package_name, "scene.json");
     let palettes_manifest_path = package_relative_path(&package_name, "palettes.json");
     let liveries_manifest_path = package_relative_path(&package_name, "liveries.json");
@@ -607,6 +638,7 @@ pub(crate) fn write_decomposed_export(
         input.root_nmc.as_ref(),
         opts.include_nodraw,
         opts.include_shields,
+        opts.keep_material_slots,
     );
 
     let root_mesh_asset = write_mesh_asset(
@@ -703,6 +735,7 @@ pub(crate) fn write_decomposed_export(
             child.nmc.as_ref(),
             opts.include_nodraw,
             opts.include_shields,
+            opts.keep_material_slots,
         );
         let mesh_asset = write_mesh_asset(
             &mut files,
@@ -814,6 +847,7 @@ pub(crate) fn write_decomposed_export(
                     None,
                     opts.include_nodraw,
                     opts.include_shields,
+                    opts.keep_material_slots,
                 );
                 let requested_mesh_asset = mesh_asset_relative_path(p4k, &entry.cgf_path, &entry.name, opts.lod_level);
                 let requested_material_sidecar = interior_material_view.sidecar_materials.as_ref().map(|materials| {
@@ -1081,7 +1115,7 @@ pub(crate) fn write_decomposed_export(
         None
     };
 
-    let scene_manifest = build_scene_manifest_value(
+    let mut scene_manifest = build_scene_manifest_value(
         &input.entity_name,
         &package_name,
         &normalize_source_path(p4k, &input.geometry_path),
@@ -1094,6 +1128,7 @@ pub(crate) fn write_decomposed_export(
         &interior_records,
         opts,
     );
+    scene_manifest["root_entity"]["body"] = serde_json::json!(input.body);
     report_progress(progress, 0.95, "Writing manifests");
     finalize_palette_records(
         &mut palette_records,
@@ -1133,7 +1168,7 @@ fn classify_exported_file_kind(relative_path: &str) -> ExportedFileKind {
         ExportedFileKind::MaterialSidecar
     } else if relative_path.ends_with(".glb") {
         ExportedFileKind::MeshAsset
-    } else if relative_path.ends_with(".png") {
+    } else if relative_path.ends_with(".png") || relative_path.ends_with(".dds.zst") {
         ExportedFileKind::TextureAsset
     } else {
         ExportedFileKind::PackageManifest
@@ -1412,7 +1447,7 @@ fn write_mesh_asset(
 fn write_material_sidecar(
     files: &mut BTreeMap<String, Vec<u8>>,
     p4k: &MappedP4k,
-    png_cache: &mut PngCache,
+    png_cache: &mut TextureStore,
     texture_cache: &mut HashMap<(String, TextureFlavor), String>,
     palettes_manifest_path: &str,
     fallback_name: &str,
@@ -1452,7 +1487,7 @@ fn write_material_sidecar(
 fn extract_material_entry(
     files: &mut BTreeMap<String, Vec<u8>>,
     p4k: &MappedP4k,
-    png_cache: &mut PngCache,
+    png_cache: &mut TextureStore,
     texture_cache: &mut HashMap<(String, TextureFlavor), String>,
     material: &SubMaterial,
     texture_mip: u32,
@@ -1778,7 +1813,7 @@ fn build_submaterial_json(
 fn build_slot_export_value(
     files: &mut BTreeMap<String, Vec<u8>>,
     p4k: &MappedP4k,
-    png_cache: &mut PngCache,
+    png_cache: &mut TextureStore,
     texture_cache: &mut HashMap<(String, TextureFlavor), String>,
     binding: &SemanticTextureBinding,
     texture_mip: u32,
@@ -1841,7 +1876,7 @@ fn slot_source_path(p4k: Option<&MappedP4k>, binding: &SemanticTextureBinding) -
 fn export_texture_asset(
     files: &mut BTreeMap<String, Vec<u8>>,
     p4k: &MappedP4k,
-    png_cache: &mut PngCache,
+    png_cache: &mut TextureStore,
     texture_cache: &mut HashMap<(String, TextureFlavor), String>,
     source_path: &str,
     flavor: TextureFlavor,
@@ -1854,10 +1889,28 @@ fn export_texture_asset(
         return Some(existing.clone());
     }
 
+    let already_written = |path: &str| existing_asset_paths.is_some_and(|paths| paths.contains(&path.to_ascii_lowercase()));
+
+    // The game's block-compressed data (TextureFormat::Bc): the full texture and its small copy
+    if png_cache.format == TextureFormat::Bc {
+        let requested_path = bc_texture_relative_path(p4k, source_path, texture_mip);
+        if already_written(&requested_path) {
+            texture_cache.insert(cache_key, requested_path.clone());
+            return Some(requested_path);
+        }
+        if let Some(texture) =
+            crate::pipeline::load_bc_texture(p4k, source_path, texture_mip, flavor == TextureFlavor::Normal)
+        {
+            let stored_path = insert_binary_file(files, requested_path, texture.full);
+            files.insert(low_texture_path(&stored_path), texture.low);
+            texture_cache.insert(cache_key, stored_path.clone());
+            return Some(stored_path);
+        }
+        // A format browsers can't read (or no such texture): PNG, as below
+    }
+
     let requested_path = texture_relative_path(p4k, source_path, flavor, texture_mip);
-    if existing_asset_paths
-        .is_some_and(|paths| paths.contains(&requested_path.to_ascii_lowercase()))
-    {
+    if already_written(&requested_path) {
         texture_cache.insert(cache_key, requested_path.clone());
         return Some(requested_path);
     }
@@ -1867,14 +1920,14 @@ fn export_texture_asset(
             p4k,
             source_path,
             texture_mip,
-            png_cache,
+            &mut png_cache.cache,
             crate::pipeline::load_diffuse_texture,
         ),
         TextureFlavor::Normal => crate::pipeline::cached_load(
             p4k,
             source_path,
             texture_mip,
-            png_cache,
+            &mut png_cache.cache,
             crate::pipeline::load_normal_texture,
         ),
     }?;
@@ -1916,7 +1969,7 @@ fn finalize_palette_records(
     records: &mut BTreeMap<String, PaletteRecord>,
     files: &mut BTreeMap<String, Vec<u8>>,
     p4k: &MappedP4k,
-    png_cache: &mut PngCache,
+    png_cache: &mut TextureStore,
     texture_cache: &mut HashMap<(String, TextureFlavor), String>,
     texture_mip: u32,
     existing_asset_paths: Option<&HashSet<String>>,
@@ -2013,6 +2066,20 @@ fn texture_relative_path(p4k: &MappedP4k, source_path: &str, flavor: TextureFlav
         TextureFlavor::Normal => replace_extension(&normalized, ".png"),
     };
     insert_stem_suffix(&base, &format!("_TEX{mip}"))
+}
+
+/// Where a block-compressed texture goes (`TextureFormat::Bc`): `<source>_TEX<mip>.dds.zst`.
+fn bc_texture_relative_path(p4k: &MappedP4k, source_path: &str, mip: u32) -> String {
+    let base = replace_extension(&normalize_source_path(p4k, source_path), ".dds.zst");
+    insert_stem_suffix(&base, &format!("_TEX{mip}"))
+}
+
+/// The small copy of a block-compressed texture: `x_TEX0.dds.zst` → `x_TEX0.low.dds.zst`.
+fn low_texture_path(path: &str) -> String {
+    match path.strip_suffix(".dds.zst") {
+        Some(stem) => format!("{stem}.low.dds.zst"),
+        None => format!("{path}.low"),
+    }
 }
 
 /// Insert `suffix` immediately before the file extension. For compound
@@ -2500,6 +2567,7 @@ mod tests {
             model_max: [0.0, 0.0, 0.0],
             scaling_min: [0.0, 0.0, 0.0],
             scaling_max: [0.0, 0.0, 0.0],
+            skin: None,
         }
     }
 
@@ -2580,12 +2648,28 @@ mod tests {
     #[test]
     fn package_directory_name_encodes_lod_and_tex() {
         assert_eq!(
-            package_directory_name("EntityClassDefinition.RSI_Aurora_Mk2", 0, 0),
+            package_directory_name("EntityClassDefinition.RSI_Aurora_Mk2", None, 0, 0),
             "RSI Aurora Mk2_LOD0_TEX0"
         );
         assert_eq!(
-            package_directory_name("EntityClassDefinition.RSI_Aurora_Mk2", 2, 1),
+            package_directory_name("EntityClassDefinition.RSI_Aurora_Mk2", None, 2, 1),
             "RSI Aurora Mk2_LOD2_TEX1"
+        );
+    }
+
+    #[test]
+    fn low_texture_path_sits_next_to_the_full_one() {
+        assert_eq!(
+            low_texture_path("Data/Objects/kap/textures/core_ddna_TEX0.dds.zst"),
+            "Data/Objects/kap/textures/core_ddna_TEX0.low.dds.zst"
+        );
+    }
+
+    #[test]
+    fn package_directory_name_says_the_body() {
+        assert_eq!(
+            package_directory_name("EntityClassDefinition.kap_combat_heavy_core_01_01_01", Some("Female"), 0, 0),
+            "kap combat heavy core 01 01 01_female_LOD0_TEX0"
         );
     }
 
@@ -3019,6 +3103,7 @@ mod tests {
                 first_vertex: 0,
                 num_vertices: 3,
                 node_parent_index: 0,
+                zone: None,
             },
             crate::types::SubMesh {
                 material_name: Some("glass".into()),
@@ -3028,6 +3113,7 @@ mod tests {
                 first_vertex: 0,
                 num_vertices: 3,
                 node_parent_index: 0,
+                zone: None,
             },
             crate::types::SubMesh {
                 material_name: Some("hull".into()),
@@ -3037,10 +3123,11 @@ mod tests {
                 first_vertex: 0,
                 num_vertices: 3,
                 node_parent_index: 0,
+                zone: None,
             },
         ]);
 
-        let view = build_decomposed_material_view(&mesh, Some(&materials), None, false, true);
+        let view = build_decomposed_material_view(&mesh, Some(&materials), None, false, true, false);
         let filtered_materials = view.sidecar_materials.expect("filtered sidecar materials");
         let glb_materials = view.glb_materials.expect("filtered glb materials");
 
@@ -3090,6 +3177,7 @@ mod tests {
                 first_vertex: 0,
                 num_vertices: 3,
                 node_parent_index: 0,
+                zone: None,
             },
             crate::types::SubMesh {
                 material_name: Some("broken".into()),
@@ -3099,6 +3187,7 @@ mod tests {
                 first_vertex: 0,
                 num_vertices: 3,
                 node_parent_index: 0,
+                zone: None,
             },
             crate::types::SubMesh {
                 material_name: Some("hull".into()),
@@ -3108,10 +3197,11 @@ mod tests {
                 first_vertex: 0,
                 num_vertices: 3,
                 node_parent_index: 0,
+                zone: None,
             },
         ]);
 
-        let view = build_decomposed_material_view(&mesh, Some(&materials), None, false, true);
+        let view = build_decomposed_material_view(&mesh, Some(&materials), None, false, true, false);
         let filtered_materials = view.sidecar_materials.expect("filtered sidecar materials");
         let glb_materials = view.glb_materials.expect("filtered glb materials");
 
@@ -3121,6 +3211,76 @@ mod tests {
         assert_eq!(view.mesh.submeshes.len(), 1);
         assert_eq!(view.mesh.submeshes[0].material_id, 0);
         assert_eq!(view.mesh.submeshes[0].material_name.as_deref(), Some("hull"));
+    }
+
+    #[test]
+    fn decomposed_material_view_keeping_slots_ignores_what_the_material_hides_or_lacks() {
+        // Colour variants share one mesh file: a variant's material may hide a slot (NoDraw) or end before
+        // one (the Lynx variants have no cushion_core). Kept slots leave every piece in, with its own slot;
+        // only the mesh's own helper pieces (named proxy...) go
+        let mut liner = sample_submaterial();
+        liner.name = "liner".into();
+        liner.shader = "NoDraw".into();
+        liner.is_nodraw = true;
+        let mut hull = sample_submaterial();
+        hull.name = "hull".into();
+        let materials = MtlFile {
+            materials: vec![liner, hull],
+            source_path: Some("Data/Objects/Characters/Test/core_variant.mtl".into()),
+            paint_override: None,
+            material_set: Default::default(),
+        };
+        let piece = |name: &str, material_id: u32, first_index: u32| crate::types::SubMesh {
+            material_name: Some(name.into()),
+            material_id,
+            first_index,
+            num_indices: 3,
+            first_vertex: 0,
+            num_vertices: 3,
+            node_parent_index: 0,
+            zone: None,
+        };
+        let mesh = sample_mesh(vec![
+            piece("liner", 0, 0),
+            piece("cushion", 9, 3),
+            piece("hull", 1, 6),
+            piece("proxy_core", 2, 9),
+        ]);
+
+        let view = build_decomposed_material_view(&mesh, Some(&materials), None, false, false, true);
+
+        assert_eq!(view.mesh.submeshes.iter().map(|s| s.material_id).collect::<Vec<_>>(), vec![0, 9, 1]);
+        assert!(view.glb_materials.is_none(), "the mesh file carries no material file's materials");
+        assert_eq!(view.sidecar_materials.map(|m| m.materials.len()), Some(2));
+    }
+
+    #[test]
+    fn decomposed_material_view_keeps_every_piece_when_the_node_chunk_is_empty() {
+        // The multitool's battery: its node chunk has no nodes, and its pieces all point at node 0
+        let mut hull = sample_submaterial();
+        hull.name = "hull".into();
+        let materials = MtlFile {
+            materials: vec![hull],
+            source_path: Some("Data/Objects/fps_weapons/Test/battery.mtl".into()),
+            paint_override: None,
+            material_set: Default::default(),
+        };
+        let mesh = sample_mesh(vec![crate::types::SubMesh {
+            material_name: Some("hull".into()),
+            material_id: 0,
+            first_index: 0,
+            num_indices: 3,
+            first_vertex: 0,
+            num_vertices: 3,
+            node_parent_index: 0,
+            zone: None,
+        }]);
+        let empty = sample_nmc(&[]);
+
+        for keep_slots in [false, true] {
+            let view = build_decomposed_material_view(&mesh, Some(&materials), Some(&empty), false, false, keep_slots);
+            assert_eq!(view.mesh.submeshes.len(), 1, "keep_material_slots {keep_slots}");
+        }
     }
 
     #[test]
@@ -3143,6 +3303,7 @@ mod tests {
                 first_vertex: 0,
                 num_vertices: 3,
                 node_parent_index: 0,
+                zone: None,
             },
             crate::types::SubMesh {
                 material_name: Some("hull".into()),
@@ -3152,11 +3313,12 @@ mod tests {
                 first_vertex: 0,
                 num_vertices: 3,
                 node_parent_index: 1,
+                zone: None,
             },
         ]);
         let nmc = sample_nmc(&["body", "shield_geo"]);
 
-        let filtered = build_decomposed_material_view(&mesh, Some(&materials), Some(&nmc), false, false);
+        let filtered = build_decomposed_material_view(&mesh, Some(&materials), Some(&nmc), false, false, false);
         assert_eq!(filtered.mesh.submeshes.len(), 2);
         assert_eq!(filtered.glb_nmc.as_ref().map(|combo| combo.nodes.len()), Some(2));
     }
@@ -3181,6 +3343,7 @@ mod tests {
                 first_vertex: 0,
                 num_vertices: 3,
                 node_parent_index: 0,
+                zone: None,
             },
             crate::types::SubMesh {
                 material_name: Some("hull".into()),
@@ -3190,11 +3353,12 @@ mod tests {
                 first_vertex: 0,
                 num_vertices: 3,
                 node_parent_index: 1,
+                zone: None,
             },
         ]);
         let nmc = sample_nmc(&["body", "sheild_arm_a_geo"]);
 
-        let filtered = build_decomposed_material_view(&mesh, Some(&materials), Some(&nmc), false, false);
+        let filtered = build_decomposed_material_view(&mesh, Some(&materials), Some(&nmc), false, false, false);
         assert_eq!(filtered.mesh.submeshes.len(), 2);
         assert_eq!(filtered.glb_nmc.as_ref().map(|combo| combo.nodes.len()), Some(2));
     }
@@ -3218,10 +3382,11 @@ mod tests {
             first_vertex: 0,
             num_vertices: 3,
             node_parent_index: 0,
+            zone: None,
         }]);
         let nmc = sample_nmc(&["body", "hardpoint_weapon_mining"]);
 
-        let filtered = build_decomposed_material_view(&mesh, Some(&materials), Some(&nmc), false, false);
+        let filtered = build_decomposed_material_view(&mesh, Some(&materials), Some(&nmc), false, false, false);
 
         assert_eq!(filtered.mesh.submeshes.len(), 1);
         assert_eq!(filtered.glb_nmc.as_ref().map(|combo| combo.nodes.len()), Some(2));

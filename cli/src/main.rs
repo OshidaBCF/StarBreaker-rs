@@ -1,3 +1,4 @@
+mod anim;
 mod chf;
 mod common;
 mod cryxml;
@@ -154,7 +155,21 @@ enum Command {
         #[command(subcommand)]
         command: nmc::NmcCommand,
     },
+    /// Animation (`.caf` / `.aim` / `.dba`) inspection
+    Anim {
+        #[command(subcommand)]
+        command: anim::AnimCommand,
+    },
     Diff(diff::DiffArgs),
+    /// Readable shader sources, decoded from the game's shader caches (Engine/ShaderCache_*.pak), without a whole diff
+    Shaders {
+        /// Output folder (sources go under <output>/ShaderSources)
+        #[arg(short, long)]
+        output: std::path::PathBuf,
+        /// Path to Data.p4k
+        #[arg(long, env = "SC_DATA_P4K")]
+        p4k: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() {
@@ -187,7 +202,9 @@ fn main() {
         Command::Chf { command } => command.run(),
         Command::Wwise { command } => command.run(),
         Command::Nmc { command } => command.run(),
+        Command::Anim { command } => command.run(),
         Command::Diff(args) => args.run(),
+        Command::Shaders { output, p4k } => diff_shaders::export_sources(p4k.as_deref(), &output),
     };
 
     if let Err(e) = result {

@@ -75,6 +75,9 @@ struct PackedGeometryInfo {
     normal_accessor_idx: Option<u32>,
     color_accessor_idx: Option<u32>,
     tangent_accessor_idx: Option<u32>,
+    /// Skinning (JOINTS_0 / WEIGHTS_0), for meshes with a skin
+    joints_accessor_idx: Option<u32>,
+    weights_accessor_idx: Option<u32>,
     submesh_idx_accessors: Vec<u32>,
 }
 
@@ -89,6 +92,7 @@ pub(crate) struct GlbBuilder {
     pub samplers_json: Vec<json::texture::Sampler>,
     pub meshes_json: Vec<json::Mesh>,
     pub nodes_json: Vec<json::Node>,
+    pub skins_json: Vec<json::Skin>,
     tex_cache: TexCache,
     tex_json_dedup: HashMap<TextureRegion, u32>,
     mat_dedup: HashMap<MaterialIdentity, u32>,
@@ -157,6 +161,7 @@ impl GlbBuilder {
             samplers_json: Vec::new(),
             meshes_json: Vec::new(),
             nodes_json: Vec::new(),
+            skins_json: Vec::new(),
             tex_cache: HashMap::new(),
             tex_json_dedup: HashMap::new(),
             mat_dedup: HashMap::new(),
@@ -239,6 +244,31 @@ impl GlbBuilder {
             }
             color_len = self.bin.len() - color_offset;
         }
+
+        // Pack skinning: 4 joint indices (u16) and 4 weights (f32) per vertex
+        let skin = mesh.skin.as_ref().filter(|s| s.joints.len() == mesh.positions.len() && !s.bones.is_empty());
+        while !self.bin.len().is_multiple_of(4) {
+            self.bin.push(0);
+        }
+        let joints_offset = self.bin.len();
+        let mut joints_len = 0;
+        let weights_offset_and_len = if let Some(skin) = skin {
+            for j in &skin.joints {
+                for k in j {
+                    self.bin.extend_from_slice(&k.to_le_bytes());
+                }
+            }
+            joints_len = self.bin.len() - joints_offset;
+            let weights_offset = self.bin.len();
+            for w in &skin.weights {
+                for k in w {
+                    self.bin.extend_from_slice(&k.to_le_bytes());
+                }
+            }
+            Some((weights_offset, self.bin.len() - weights_offset))
+        } else {
+            None
+        };
 
         // Pad to 4-byte boundary before indices
         while !self.bin.len().is_multiple_of(4) {
@@ -359,6 +389,46 @@ impl GlbBuilder {
             json::accessor::Type::Vec4,
             None,
         );
+        let joints_accessor_idx = (joints_len > 0).then(|| {
+            let bv = self.buffer_views.len() as u32;
+            self.buffer_views.push(json::buffer::View {
+                buffer: json::Index::new(0),
+                byte_offset: Some(json::validation::USize64(joints_offset as u64)),
+                byte_length: json::validation::USize64(joints_len as u64),
+                byte_stride: None,
+                target: Some(Checked::Valid(json::buffer::Target::ArrayBuffer)),
+                name: None,
+                extensions: None,
+                extras: Default::default(),
+            });
+            let acc = self.accessors.len() as u32;
+            self.accessors.push(json::Accessor {
+                buffer_view: Some(json::Index::new(bv)),
+                byte_offset: Some(json::validation::USize64(0)),
+                count: json::validation::USize64(mesh.positions.len() as u64),
+                component_type: Checked::Valid(json::accessor::GenericComponentType(json::accessor::ComponentType::U16)),
+                type_: Checked::Valid(json::accessor::Type::Vec4),
+                min: None,
+                max: None,
+                name: None,
+                normalized: false,
+                sparse: None,
+                extensions: None,
+                extras: Default::default(),
+            });
+            acc
+        });
+        let weights_accessor_idx = weights_offset_and_len.and_then(|(offset, len)| {
+            super::add_vertex_accessor(
+                &mut self.buffer_views,
+                &mut self.accessors,
+                offset,
+                len,
+                mesh.positions.len(),
+                json::accessor::Type::Vec4,
+                None,
+            )
+        });
 
         // Index buffer view
         let idx_bv_idx = self.buffer_views.len() as u32;
@@ -405,6 +475,8 @@ impl GlbBuilder {
             normal_accessor_idx,
             color_accessor_idx,
             tangent_accessor_idx,
+            joints_accessor_idx,
+            weights_accessor_idx,
             submesh_idx_accessors,
         }
     }
@@ -485,52 +557,135 @@ impl GlbBuilder {
         }
     }
 
-    /// Attach skeleton bone nodes to the first scene root, registering them in the name map.
+    /// Attach skeleton bone nodes under the first scene root, as the skeleton's hierarchy (each bone under its
+    /// parent bone, with its transform relative to it), registering them in the name map. They sit where the
+    /// skeleton's bind pose puts them (the attach points of gear and of an item's own parts), and a skinned
+    /// mesh's joints are these nodes, so moving a bone (an animation) moves what hangs on it and what it skins.
     pub fn attach_skeleton_bones(
         &mut self,
         bones: &[crate::skeleton::Bone],
         scene_nodes: &[json::Index<json::Node>],
     ) {
-        for bone in bones {
-            let bone_node_idx = self.nodes_json.len() as u32;
-
-            // Convert quaternion [w,x,y,z] + translation to 3x4 matrix.
+        let world = |bone: &crate::skeleton::Bone| {
             let [qw, qx, qy, qz] = bone.world_rotation;
-            let rot = glam::Quat::from_xyzw(qx, qy, qz, qw);
-            let trans = glam::Vec3::from(bone.world_position);
-            let m = glam::Mat4::from_rotation_translation(rot, trans);
-            let cols = m.to_cols_array();
-
-            // Convert to our 3x4 row-major format for mat3x4_to_gltf
+            glam::Mat4::from_rotation_translation(glam::Quat::from_xyzw(qx, qy, qz, qw), glam::Vec3::from(bone.world_position))
+        };
+        let parent_of = |i: usize| bones[i].parent_index.map(|p| p as usize).filter(|&p| p < bones.len() && p != i);
+        let first = self.nodes_json.len() as u32;
+        for (i, bone) in bones.iter().enumerate() {
+            let local = match parent_of(i) {
+                Some(p) => world(&bones[p]).inverse() * world(bone),
+                None => world(bone),
+            };
+            let cols = local.to_cols_array();
             let bone_matrix: [[f32; 4]; 3] = [
-                [cols[0], cols[4], cols[8],  cols[12]],
-                [cols[1], cols[5], cols[9],  cols[13]],
+                [cols[0], cols[4], cols[8], cols[12]],
+                [cols[1], cols[5], cols[9], cols[13]],
                 [cols[2], cols[6], cols[10], cols[14]],
             ];
-
             let matrix = if super::is_identity_or_zero(&bone_matrix) {
                 None
             } else {
                 Some(super::mat3x4_to_gltf(&bone_matrix))
             };
-
             self.nodes_json.push(json::Node {
                 name: Some(bone.name.clone()),
                 matrix,
                 ..Default::default()
             });
-
-            // Add to lookup map (lowercase for case-insensitive matching).
-            // Only insert if not already present — NMC nodes take priority.
-            self.node_name_to_idx
-                .entry(bone.name.to_lowercase())
-                .or_insert(bone_node_idx);
-
-            // Attach bone node to the first scene root node
-            if let Some(root_node) = scene_nodes.first() {
-                let root_idx = root_node.value() as u32;
-                self.append_child_to_node(root_idx, bone_node_idx);
+            // Lookup by lowercased name; NMC nodes registered first take priority.
+            self.node_name_to_idx.entry(bone.name.to_lowercase()).or_insert(first + i as u32);
+        }
+        for i in 0..bones.len() {
+            let parent_idx = match parent_of(i) {
+                Some(p) => Some(first + p as u32),
+                None => scene_nodes.first().map(|root| root.value() as u32),
+            };
+            if let Some(parent_idx) = parent_idx {
+                self.append_child_to_node(parent_idx, first + i as u32);
             }
+        }
+    }
+
+    /// Make `mesh_node_idx` a skinned mesh: its glTF skin's joints are the bone nodes named like the skin's
+    /// bones (a bone the scene doesn't have gets a node under the scene root), its inverse bind matrices the
+    /// inverses of those bones' bind pose (model space, where the vertices are). Joint order is the skin's
+    /// bone order, which the vertices' JOINTS_0 point into.
+    pub fn attach_skin(
+        &mut self,
+        skin: &crate::types::SkinWeights,
+        mesh_node_idx: u32,
+        scene_nodes: &[json::Index<json::Node>],
+    ) {
+        if skin.bones.is_empty() {
+            return;
+        }
+        let missing: Vec<crate::skeleton::Bone> = skin
+            .bones
+            .iter()
+            .filter(|b| !self.node_name_to_idx.contains_key(&b.name.to_lowercase()))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            log::debug!("skin: {} bones without a node, added", missing.len());
+            // world placement for each (bind pose), each a direct child of the root
+            let flat: Vec<crate::skeleton::Bone> = missing.into_iter().map(|mut b| { b.parent_index = None; b }).collect();
+            self.attach_skeleton_bones(&flat, scene_nodes);
+        }
+        let joints: Vec<json::Index<json::Node>> = skin
+            .bones
+            .iter()
+            .map(|b| json::Index::new(self.node_name_to_idx[&b.name.to_lowercase()]))
+            .collect();
+
+        while !self.bin.len().is_multiple_of(4) {
+            self.bin.push(0);
+        }
+        let offset = self.bin.len();
+        for bone in &skin.bones {
+            let [qw, qx, qy, qz] = bone.world_rotation;
+            let bind = glam::Mat4::from_rotation_translation(glam::Quat::from_xyzw(qx, qy, qz, qw), glam::Vec3::from(bone.world_position));
+            for v in bind.inverse().to_cols_array() {
+                self.bin.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let bv = self.buffer_views.len() as u32;
+        self.buffer_views.push(json::buffer::View {
+            buffer: json::Index::new(0),
+            byte_offset: Some(json::validation::USize64(offset as u64)),
+            byte_length: json::validation::USize64((self.bin.len() - offset) as u64),
+            byte_stride: None,
+            target: None,
+            name: None,
+            extensions: None,
+            extras: Default::default(),
+        });
+        let acc = self.accessors.len() as u32;
+        self.accessors.push(json::Accessor {
+            buffer_view: Some(json::Index::new(bv)),
+            byte_offset: Some(json::validation::USize64(0)),
+            count: json::validation::USize64(skin.bones.len() as u64),
+            component_type: Checked::Valid(json::accessor::GenericComponentType(json::accessor::ComponentType::F32)),
+            type_: Checked::Valid(json::accessor::Type::Mat4),
+            min: None,
+            max: None,
+            name: None,
+            normalized: false,
+            sparse: None,
+            extensions: None,
+            extras: Default::default(),
+        });
+        let skin_idx = self.skins_json.len() as u32;
+        self.skins_json.push(json::Skin {
+            extensions: None,
+            extras: Default::default(),
+            inverse_bind_matrices: Some(json::Index::new(acc)),
+            joints,
+            name: None,
+            skeleton: None,
+        });
+        if let Some(node) = self.nodes_json.get_mut(mesh_node_idx as usize) {
+            node.skin = Some(json::Index::new(skin_idx));
         }
     }
 
@@ -557,6 +712,8 @@ impl GlbBuilder {
             );
         }
         let has_mesh = !child.mesh.positions.is_empty();
+        // Bundled children get no glTF skin: their bone weights would bind nothing
+        child.mesh.skin = None;
 
         // Pack mesh data (skip for NMC-only entities with no geometry).
         let child_packed = if has_mesh {
@@ -1044,6 +1201,10 @@ impl GlbBuilder {
                     json::Index::new(tangent_idx),
                 );
             }
+            if let (Some(joints), Some(weights)) = (geometry.joints_accessor_idx, geometry.weights_accessor_idx) {
+                attributes.insert(Checked::Valid(json::mesh::Semantic::Joints(0)), json::Index::new(joints));
+                attributes.insert(Checked::Valid(json::mesh::Semantic::Weights(0)), json::Index::new(weights));
+            }
 
             primitives.push(json::mesh::Primitive {
                 attributes,
@@ -1052,7 +1213,7 @@ impl GlbBuilder {
                 mode: Checked::Valid(json::mesh::Mode::Triangles),
                 targets: None,
                 extensions: None,
-                extras: Default::default(),
+                extras: piece_extras(sub),
             });
         }
 
@@ -1158,7 +1319,7 @@ impl GlbBuilder {
                         mode: Checked::Valid(json::mesh::Mode::Triangles),
                         targets: None,
                         extensions: None,
-                        extras: Default::default(),
+                        extras: piece_extras(&submeshes[si]),
                     });
                 }
                 node_mesh_idx[nmc_idx] = Some(self.meshes_json.len() as u32);
@@ -1350,6 +1511,7 @@ impl GlbBuilder {
             textures: self.textures_json,
             samplers: self.samplers_json,
             nodes: self.nodes_json,
+            skins: self.skins_json,
             scenes: scenes_json,
             scene: Some(json::Index::new(0)),
             extensions_used,
@@ -1359,6 +1521,21 @@ impl GlbBuilder {
 
         serialize_glb(&root, &self.bin)
     }
+}
+
+/// glTF extras for a mesh piece (three.js puts them in the geometry's `userData`):
+/// - `"slot"`: its material slot in the material file, which glTF material indices don't keep (materials are
+///   numbered in the order pieces use them, and a mesh may not use every slot). With
+///   `ExportOptions::keep_material_slots` it is the slot in every material file used with the mesh.
+/// - `"zone"` when it has one (see [`crate::types::SubMesh::zone`]): its hash, so a viewer can show or hide the
+///   piece as the game does.
+fn piece_extras(sub: &crate::types::SubMesh) -> Option<Box<serde_json::value::RawValue>> {
+    let mut map = serde_json::Map::new();
+    map.insert("slot".into(), serde_json::json!(sub.material_id));
+    if let Some(zone) = sub.zone {
+        map.insert("zone".into(), serde_json::json!(zone));
+    }
+    map_to_raw_value(map)
 }
 
 /// Serialize a [`serde_json::Map`] into a [`RawValue`] for glTF extras.
@@ -1665,6 +1842,7 @@ fn hash_mesh_for_reuse(mesh: &Mesh, include_tangents: bool) -> u64 {
         submesh.first_vertex.hash(&mut hasher);
         submesh.num_vertices.hash(&mut hasher);
         submesh.node_parent_index.hash(&mut hasher);
+        submesh.zone.hash(&mut hasher);
     }
 
     hasher.finish()

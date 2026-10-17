@@ -15,8 +15,8 @@ pub mod chrparams;
 
 pub use error::Error;
 pub use pipeline::{
-    DecomposedExport, ExportFormat, ExportKind, ExportOptions, ExportResult, ExportedFile,
-    ExportedFileKind, MaterialMode,
+    DecomposedExport, EntityOverrides, ExportFormat, ExportKind, ExportOptions, ExportResult, ExportedFile,
+    ExportedFileKind, MaterialMode, TextureFormat,
     assemble_glb_with_loadout, assemble_glb_with_loadout_with_progress,
     dump_hierarchy, load_invisible_ports, query_animation_controller_source,
     resolve_loadout_meshes, socpaks_to_glb,
@@ -66,8 +66,23 @@ pub(crate) fn parse_skin_with_options(data: &[u8], use_model_bbox: bool) -> Resu
 /// If `metadata` is provided (the primary `.cgf`/`.skin` bytes), NMC transforms
 /// are parsed from it and applied to the scene graph.
 pub fn skin_to_glb(data: &[u8], metadata: Option<&[u8]>) -> Result<Vec<u8>, Error> {
-    let mesh = parse_skin(data)?;
+    skin_to_glb_with(data, metadata, false)
+}
+
+/// [`skin_to_glb`], optionally `skinned`: the mesh keeps its bone weights, with the skeleton of `metadata`
+/// (the `.skin`, whose bone list the weights point into) as its joints, so it can be animated. The NMC is
+/// left out then (a skin's pieces are in model space, its bones place nothing).
+pub fn skin_to_glb_with(data: &[u8], metadata: Option<&[u8]>, skinned: bool) -> Result<Vec<u8>, Error> {
+    let mut mesh = parse_skin(data)?;
+    if skinned {
+        let bones = metadata.and_then(skeleton::parse_skeleton).unwrap_or_default();
+        match mesh.skin.as_mut() {
+            Some(skin) if !bones.is_empty() => skin.bones = bones,
+            _ => log::warn!("skinned export: no bone weights or no skeleton, written static"),
+        }
+    }
     let root_nmc = metadata
+        .filter(|_| !skinned)
         .and_then(nmc::parse_nmc_full)
         .map(|(nodes, mat_indices)| nmc::NodeMeshCombo {
             nodes,

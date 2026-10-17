@@ -161,6 +161,27 @@ impl BoneMap12 {
     }
 }
 
+/// IVOBONEMAP32 (24 bytes a vertex: whole bodies, `m_body.skinm`): 8 joint indices (u16) then 8 weights (u8,
+/// summing to 255), up to 8 bones a vertex. Kept: the 4 heaviest (as glTF's JOINTS_0 / WEIGHTS_0 and three.js
+/// take; weights are renormalized when used).
+fn bone_maps_from_32(raw: &[[u8; 24]]) -> Option<Vec<BoneMap12>> {
+    Some(
+        raw.iter()
+            .map(|r| {
+                let mut slots: Vec<(u16, u8)> =
+                    (0..8).map(|k| (u16::from_le_bytes([r[2 * k], r[2 * k + 1]]), r[16 + k])).collect();
+                slots.sort_by(|a, b| b.1.cmp(&a.1));
+                let mut map = BoneMap12 { joint_indices: [0; 4], weights: [0; 4] };
+                for (k, (joint, weight)) in slots.into_iter().take(4).enumerate() {
+                    map.joint_indices[k] = joint;
+                    map.weights[k] = weight;
+                }
+                map
+            })
+            .collect(),
+    )
+}
+
 /// Raw normal data — format determined by which stream was present.
 #[derive(Debug)]
 pub enum NormalData {
@@ -430,6 +451,15 @@ impl SkinMesh {
                         reader.advance(element_size as usize * num_verts)?;
                     }
                 }
+                stream_type::IVOBONEMAP32 if element_size == 24 => {
+                    let raw = reader.read_slice::<[u8; 24]>(num_verts)?;
+                    if std::env::var("SB_DUMP_BONEMAP").is_ok() {
+                        for (i, r) in raw.iter().take(12).enumerate() {
+                            eprintln!("BONEMAP32[{i}]: {:02X?}", r);
+                        }
+                    }
+                    bone_maps = bone_maps_from_32(&raw);
+                }
                 _ => {
                     let count = num_verts;
                     let skip_bytes = element_size as usize * count;
@@ -466,5 +496,25 @@ impl SkinMesh {
             tangents,
             normals,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bone_map_32_keeps_the_four_heaviest_bones() {
+        // 8 joints (u16) then 8 weights (u8): bones 25, 27, 28 at 192 + 59 + 4 (a body vertex), plus five light
+        // ones of 0 to test the order
+        let mut r = [0u8; 24];
+        for (k, j) in [25u16, 27, 28, 3, 4, 5, 6, 7].iter().enumerate() {
+            r[2 * k..2 * k + 2].copy_from_slice(&j.to_le_bytes());
+        }
+        r[16..24].copy_from_slice(&[4, 192, 59, 0, 0, 0, 0, 0]);
+        let maps = bone_maps_from_32(&[r]).unwrap();
+        assert_eq!(maps[0].joint_indices[..3], [27, 28, 25]);
+        assert_eq!(maps[0].weights[..3], [192, 59, 4]);
+        assert_eq!(maps[0].weights[3], 0);
     }
 }

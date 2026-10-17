@@ -46,6 +46,10 @@ pub struct ExportOpts {
     /// Texture mip level (0=full, 2=1/4 res, 4=1/16 res)
     #[arg(long, default_value = "2")]
     pub mip: u32,
+    /// Decomposed texture files: png, or bc (the game's block-compressed data as it is, in zstd-compressed
+    /// .dds files, every mip level from --mip down, plus a small .low copy)
+    #[arg(long, default_value = "png", value_parser = ["png", "bc"])]
+    pub textures: String,
     /// LOD level (0=highest detail, 1+=lower)
     #[arg(long, default_value = "1")]
     pub lod: u32,
@@ -67,6 +71,22 @@ pub struct ExportOpts {
     /// Include shield helper meshes and shield attachments in exports
     #[arg(long)]
     pub include_shields: bool,
+    /// Wearables (armor, clothing...): model worn by the male or female body, or the prop shown when carried or dropped
+    #[arg(long, default_value = "male", value_parser = ["male", "female", "prop"])]
+    pub body: String,
+    /// Decomposed: write every piece of a mesh with its own material slot (stored on each piece), whatever the
+    /// material file hides or lacks, so one mesh file serves every material used with it (colour variants);
+    /// the reader hides the pieces whose material is NoDraw or missing
+    #[arg(long)]
+    pub keep_material_slots: bool,
+    /// Keep skinned meshes (.skin) deformable: their bone weights and the skin's own bones as glTF joints, so the
+    /// item can follow an animated skeleton (bound by bone name). Without it, meshes are static in the bind pose.
+    #[arg(long)]
+    pub skinned: bool,
+    /// With --skip-existing-assets: keep the existing textures but write the meshes again (after an export
+    /// change that only touches meshes, like --skinned)
+    #[arg(long)]
+    pub rewrite_meshes: bool,
 }
 
 impl From<&ExportOpts> for starbreaker_3d::ExportOptions {
@@ -99,10 +119,19 @@ impl From<&ExportOpts> for starbreaker_3d::ExportOptions {
             include_nodraw: opts.include_nodraw,
             include_shields: opts.include_shields,
             texture_mip: opts.mip,
+            texture_format: if opts.textures == "bc" {
+                starbreaker_3d::TextureFormat::Bc
+            } else {
+                starbreaker_3d::TextureFormat::Png
+            },
             lod_level: opts.lod,
             include_animations: matches!(kind, starbreaker_3d::ExportKind::Decomposed),
             apply_default_animation_pose: !matches!(kind, starbreaker_3d::ExportKind::Decomposed),
             default_animation_tags: vec!["landing_gear_extend".to_string()],
+            body: (opts.body != "prop").then(|| opts.body.clone()),
+            overrides: None,
+            keep_material_slots: opts.keep_material_slots,
+            skinned: opts.skinned,
         }
     }
 }
