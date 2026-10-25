@@ -1433,13 +1433,23 @@ pub fn dump_database_to_json(
     all_keyframes: bool,
 ) -> serde_json::Value {
     let filter_lc = filter.map(|f| f.to_ascii_lowercase());
+    let keep = |clip: &AnimationClip| filter_lc.as_ref().map_or(true, |needle| clip.name.to_ascii_lowercase().contains(needle));
+    dump_database_clips_to_json(db, hash_to_name, keep, bone_filter, all_keyframes)
+}
+
+/// [`dump_database_to_json`] for the clips `keep` accepts; `index` and `clip_count` stay the database's own.
+pub fn dump_database_clips_to_json(
+    db: &AnimationDatabase,
+    hash_to_name: &std::collections::HashMap<u32, String>,
+    keep: impl Fn(&AnimationClip) -> bool,
+    bone_filter: Option<&str>,
+    all_keyframes: bool,
+) -> serde_json::Value {
     let bone_filter_lc = bone_filter.map(|f| f.to_ascii_lowercase());
     let mut clips_out: Vec<serde_json::Value> = Vec::new();
     for (idx, clip) in db.clips.iter().enumerate() {
-        if let Some(needle) = filter_lc.as_ref() {
-            if !clip.name.to_ascii_lowercase().contains(needle) {
-                continue;
-            }
+        if !keep(clip) {
+            continue;
         }
         let frame_count = clip
             .channels

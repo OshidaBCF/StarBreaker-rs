@@ -637,6 +637,12 @@ fn load_geometry_parts(
         mesh.skin = None;
     }
 
+    if !skinned {
+        if let Some(ref combo) = nmc {
+            root_pieces_to_root_space(&mut mesh, combo);
+        }
+    }
+
     // The nodes are the skeleton's bones (a skin without a node chunk of its own): its pieces were moved into
     // their bones' space
     let mut nodes_are_bones = false;
@@ -5265,6 +5271,49 @@ fn file_under_root_node(mesh: &mut crate::Mesh, combo: &crate::nmc::NodeMeshComb
     }
     for submesh in &mut mesh.submeshes {
         submesh.node_parent_index = root as u16;
+    }
+}
+
+/// The pieces on a node chunk's root lie in model space, not in the root's own space: the rangefinder's
+/// FakeOptic lens (gdgt_fps_behr_bncl_lense.cgf, one node `ADS_align` at x 3 cm, y -10 cm) has its disc's
+/// vertices already at that spot, and with the node's transform on top the disc floated 10 cm off the device
+/// (2026-10-24). They're moved by the inverse of the root's transform, so the glTF writer puts them back; pieces
+/// on other nodes are untouched. Vertices shared with a piece on another node are left alone.
+fn root_pieces_to_root_space(mesh: &mut crate::Mesh, combo: &crate::nmc::NodeMeshCombo) {
+    let Some(root) = combo.nodes.iter().position(|node| node.parent_index.is_none()) else {
+        return;
+    };
+    let m = combo.nodes[root].bone_to_world;
+    let to_world = glam::Mat4::from_cols(
+        glam::Vec4::new(m[0][0], m[1][0], m[2][0], 0.0),
+        glam::Vec4::new(m[0][1], m[1][1], m[2][1], 0.0),
+        glam::Vec4::new(m[0][2], m[1][2], m[2][2], 0.0),
+        glam::Vec4::new(m[0][3], m[1][3], m[2][3], 1.0),
+    );
+    if to_world.determinant().abs() <= 1e-6 || to_world.abs_diff_eq(glam::Mat4::IDENTITY, 1e-5) {
+        return;
+    }
+    // 1 = on the root only, 2 = on another node too
+    let mut owner = vec![0u8; mesh.positions.len()];
+    for sub in &mesh.submeshes {
+        let start = sub.first_index as usize;
+        let end = (start + sub.num_indices as usize).min(mesh.indices.len());
+        let on_root = sub.node_parent_index as usize == root;
+        for &idx in &mesh.indices[start..end] {
+            let Some(o) = owner.get_mut(idx as usize) else { continue };
+            *o = if on_root && *o != 2 { 1 } else { 2 };
+        }
+    }
+    let to_root = to_world.inverse();
+    let to_root3 = glam::Mat3::from_mat4(to_root);
+    for (vi, &o) in owner.iter().enumerate() {
+        if o != 1 {
+            continue;
+        }
+        mesh.positions[vi] = to_root.transform_point3(glam::Vec3::from(mesh.positions[vi])).into();
+        if let Some(ref mut normals) = mesh.normals {
+            normals[vi] = (to_root3 * glam::Vec3::from(normals[vi])).normalize_or_zero().into();
+        }
     }
 }
 
