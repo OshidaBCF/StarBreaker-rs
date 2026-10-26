@@ -152,6 +152,10 @@ pub struct EntityOverrides {
     pub material: Option<String>,
     /// TintPaletteTree record short name (kap_combat_heavy_02_03_01); "none" for no palette.
     pub palette: Option<String>,
+    /// Geometry path to export instead of the record's (Objects/planets/flora/tree/spruce_01/spruce_01_a.cgf):
+    /// meshes the game places by path with no record of their own (trees, grass, rocks), exported through a
+    /// carrier record.
+    pub geometry: Option<String>,
 }
 
 impl Default for ExportOptions {
@@ -401,6 +405,13 @@ fn worn_geometry(
             }
         }
         None => (geometry_path, material_path),
+    };
+    let geometry_path = match overrides_for(db, record, opts).and_then(|o| o.geometry.clone()) {
+        Some(geometry) => {
+            log::info!("geometry override: {geometry} (instead of {geometry_path})");
+            geometry
+        }
+        None => geometry_path,
     };
     match overrides_for(db, record, opts).and_then(|o| o.material.clone()) {
         Some(material) => {

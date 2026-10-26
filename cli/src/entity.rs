@@ -173,6 +173,10 @@ pub enum EntityCommand {
         /// Tint palette to use instead of the entity's own: a TintPaletteTree record name, or "none"
         #[arg(long)]
         palette: Option<String>,
+        /// Mesh to export through the entity instead of its own (Objects/.../name.cgf), for meshes with no record
+        /// of their own (trees, grass): the entity is only a carrier, its attachments are dropped
+        #[arg(long)]
+        geometry: Option<String>,
         #[command(flatten)]
         opts: ExportOpts,
     },
@@ -181,9 +185,11 @@ pub enum EntityCommand {
     /// "ok\t<record>\t<body>\t<seconds>" or "FAIL\t<record>\t<body>\t<error>")
     ExportList {
         /// JSON list: [{"record": "<exact name>", "body": "male|female|prop", "material": "<.mtl path>",
-        /// "palette": "<TintPaletteTree name|none>", "group": "<id>"}]. material, palette and group are optional;
-        /// consecutive entries with the same group run one after the other on one worker (variants of one
-        /// model share textures)
+        /// "palette": "<TintPaletteTree name|none>", "group": "<id>", "geometry": "<.cgf/.cga path>",
+        /// "name": "<package name>"}]. Only record is required. Consecutive entries with the same group run one
+        /// after the other on one worker (variants of one model share textures). geometry: that mesh is exported
+        /// through the record (a carrier, its attachments dropped), for meshes with no record of their own
+        /// (trees, grass); give it its material, and palette "none"
         list: PathBuf,
         /// Output folder (Data/ and Packages/ go in it)
         output: PathBuf,
@@ -216,8 +222,9 @@ impl EntityCommand {
                 dump_hierarchy,
                 material,
                 palette,
+                geometry,
                 opts,
-            } => export(name, output, p4k, dump_hierarchy, material, palette, opts),
+            } => export(name, output, p4k, dump_hierarchy, material, palette, geometry, opts),
             Self::ExportList { list, output, p4k, jobs, opts } => export_list(list, output, p4k, jobs, opts),
             Self::Loadout { name, p4k } => loadout(name, p4k),
         }
@@ -248,6 +255,7 @@ fn export(
     dump_hierarchy: bool,
     material: Option<String>,
     palette: Option<String>,
+    geometry: Option<String>,
     opts: ExportOpts,
 ) -> Result<()> {
     crate::log_mem_stats("start");
@@ -271,11 +279,13 @@ fn export(
 
     let idx = EntityIndex::new(&db);
     let mut export_opts = starbreaker_3d::ExportOptions::from(&opts);
-    if material.is_some() || palette.is_some() {
+    let carried = geometry.is_some();
+    if material.is_some() || palette.is_some() || geometry.is_some() {
         export_opts.overrides = Some(starbreaker_3d::EntityOverrides {
             record: export_entity_name(rname),
             material,
             palette,
+            geometry,
         });
     }
     let output = output.unwrap_or_else(|| {
@@ -295,7 +305,10 @@ fn export(
     };
 
     crate::log_mem_stats("before loadout resolve");
-    let tree = resolve_loadout_indexed(&idx, record);
+    let mut tree = resolve_loadout_indexed(&idx, record);
+    if carried {
+        tree.root.children.clear();
+    }
     crate::log_mem_stats("after loadout resolve");
 
     eprintln!("\nLoadout tree for {}:", tree.root.entity_name);
@@ -377,6 +390,9 @@ struct ListEntry {
     material: Option<String>,
     palette: Option<String>,
     group: Option<String>,
+    /// Mesh exported through the record instead of its own, and its package name (see ExportList)
+    geometry: Option<String>,
+    name: Option<String>,
 }
 
 fn read_export_list(path: &Path) -> Result<Vec<ListEntry>> {
@@ -399,6 +415,8 @@ fn read_export_list(path: &Path) -> Result<Vec<ListEntry>> {
                 material: text_field(item, "material"),
                 palette: text_field(item, "palette"),
                 group: text_field(item, "group"),
+                geometry: text_field(item, "geometry"),
+                name: text_field(item, "name"),
             })
         })
         .collect()
@@ -421,14 +439,24 @@ fn export_list_entry(
     let rname = db.resolve_string2(record.name_offset);
     let mut export_opts = base_opts.clone();
     export_opts.body = (entry.body != "prop").then(|| entry.body.clone());
-    if entry.material.is_some() || entry.palette.is_some() {
+    if entry.material.is_some() || entry.palette.is_some() || entry.geometry.is_some() {
         export_opts.overrides = Some(starbreaker_3d::EntityOverrides {
             record: export_entity_name(rname),
             material: entry.material.clone(),
             palette: entry.palette.clone(),
+            geometry: entry.geometry.clone(),
         });
     }
-    let tree = resolve_loadout_indexed(idx, record);
+    let mut tree = resolve_loadout_indexed(idx, record);
+    // A mesh exported through a carrier record: none of the carrier's attachments, and the package is named
+    // after the mesh file (or the entry's "name")
+    if let Some(geometry) = &entry.geometry {
+        tree.root.children.clear();
+        tree.root.entity_name = entry.name.clone().unwrap_or_else(|| {
+            let file = geometry.rsplit(['/', '\\']).next().unwrap_or(geometry);
+            file.rsplit_once('.').map_or(file, |(stem, _)| stem).to_string()
+        });
+    }
     // A copy: the other workers add to the shared set while this export runs
     let known = written.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let result = starbreaker_3d::assemble_glb_with_loadout_with_progress(
