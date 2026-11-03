@@ -87,6 +87,25 @@ pub struct ExportOpts {
     /// change that only touches meshes, like --skinned)
     #[arg(long)]
     pub rewrite_meshes: bool,
+    /// Interior meshes under this game folder ("Data/Objects/space/3d/asteroid", repeatable) at LOD 0 whatever
+    /// --lod says, marked "full_lod": true in the GLB mesh's extras (the map's rocks, buildings at a lighter LOD)
+    #[arg(long = "full-lod-under")]
+    pub full_lod_under: Vec<String>,
+    /// Interior meshes under this game folder ("Data/Objects/space/2d", repeatable) or of this model (a .cgf / .cga
+    /// path) left out (what only makes sense with its textures: nebula sprites, plants' leaf cards)
+    #[arg(long = "skip-under")]
+    pub skip_under: Vec<String>,
+}
+
+/// "Data\Objects\Space\2d" -> "objects/space/2d/": the form ExportOptions compares paths with. A single model
+/// ("Data/Objects/default/plane_0647x1.cgf") -> its name without the extension, so its _lodN files go with it
+fn folder_key(f: &str) -> String {
+    let f = f.replace('\\', "/").to_ascii_lowercase();
+    let f = f.strip_prefix("data/").unwrap_or(&f).trim_end_matches('/').to_string();
+    match f.strip_suffix(".cgf").or_else(|| f.strip_suffix(".cga")) {
+        Some(stem) => stem.to_string(),
+        None => format!("{f}/"),
+    }
 }
 
 impl From<&ExportOpts> for starbreaker_3d::ExportOptions {
@@ -132,6 +151,8 @@ impl From<&ExportOpts> for starbreaker_3d::ExportOptions {
             overrides: None,
             keep_material_slots: opts.keep_material_slots,
             skinned: opts.skinned,
+            full_lod_under: opts.full_lod_under.iter().map(|f| folder_key(f)).collect(),
+            skip_under: opts.skip_under.iter().map(|f| folder_key(f)).collect(),
         }
     }
 }

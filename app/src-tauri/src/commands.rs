@@ -735,6 +735,8 @@ pub async fn start_export(
         overrides: None,
         keep_material_slots: false,
         skinned: false,
+        full_lod_under: Vec::new(),
+        skip_under: Vec::new(),
     };
 
     log::info!(

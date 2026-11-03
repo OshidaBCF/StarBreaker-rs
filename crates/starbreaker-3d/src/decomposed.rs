@@ -1458,7 +1458,20 @@ fn write_material_sidecar(
     existing_asset_paths: Option<&HashSet<String>>,
 ) -> String {
     let source_material_path = material_source_path(p4k, materials, material_path, geometry_path);
-    let relative_path = material_sidecar_relative_path(&source_material_path, fallback_name, texture_mip);
+    // A mesh named after its .cdf carries parts with material files of their own (load_geometry_parts), added
+    // after its main material's: the list is that main material's with that .cdf's parts, so its file is named
+    // after both. Named after the main .mtl alone, the Mercenary LMG "Epoque" overwrote the plain LMG's list with
+    // its ornaments' (or the other way round); after the .cdf alone, the colour variants with a material of their
+    // own (LMG tint 4 and 5) shared one list
+    let sidecar_source = if geometry_path.to_ascii_lowercase().ends_with(".cdf") {
+        let cdf = normalize_source_path(p4k, geometry_path);
+        let cdf_stem = cdf.rsplit('/').next().unwrap_or(&cdf);
+        let cdf_stem = cdf_stem.rsplit_once('.').map_or(cdf_stem, |(stem, _)| stem);
+        replace_extension(&source_material_path, &format!("__{cdf_stem}.mtl"))
+    } else {
+        source_material_path.clone()
+    };
+    let relative_path = material_sidecar_relative_path(&sidecar_source, fallback_name, texture_mip);
     let extracted = materials
         .materials
         .iter()

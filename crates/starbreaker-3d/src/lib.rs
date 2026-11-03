@@ -19,7 +19,7 @@ pub use pipeline::{
     ExportedFileKind, MaterialMode, TextureFormat,
     assemble_glb_with_loadout, assemble_glb_with_loadout_with_progress,
     dump_hierarchy, load_invisible_ports, query_animation_controller_source,
-    resolve_loadout_meshes, socpaks_to_glb,
+    resolve_loadout_meshes, socpaks_to_glb, socpaks_to_glbs,
 };
 pub use types::Mesh;
 

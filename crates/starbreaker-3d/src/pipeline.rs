@@ -141,6 +141,30 @@ pub struct ExportOptions {
     /// .skin's own bones, written as a glTF skin. A reader binds the joints to an animated skeleton by bone name.
     /// Without it, skinned meshes are static in the bind pose (and the .cdf parts placed by the node chunk).
     pub skinned: bool,
+    /// Interior meshes whose geometry path starts with one of these folders (lower case, "/" separators, no
+    /// leading "data/": "objects/space/3d/asteroid/") are loaded at LOD 0 whatever `lod_level` says: the rocks of
+    /// a map export, kept in their real shape while the buildings use a lighter LOD.
+    pub full_lod_under: Vec<String>,
+    /// Interior meshes whose geometry path starts with one of these folders (same form as `full_lod_under`) are
+    /// left out: what only makes sense with its textures (2D nebula sprites, plants' leaf cards) on a map export.
+    pub skip_under: Vec<String>,
+}
+
+impl ExportOptions {
+    /// Whether an interior mesh path is under one of `full_lod_under`.
+    pub fn full_lod_for(&self, geometry_path: &str) -> bool {
+        self.under(&self.full_lod_under, geometry_path)
+    }
+
+    /// Whether a geometry path is under one of these folders (lower case, "/", no leading "data/", ending in "/").
+    pub fn under(&self, folders: &[String], geometry_path: &str) -> bool {
+        if folders.is_empty() {
+            return false;
+        }
+        let p = geometry_path.replace('\\', "/").to_ascii_lowercase();
+        let p = p.strip_prefix("data/").unwrap_or(&p);
+        folders.iter().any(|f| p.starts_with(f.as_str()))
+    }
 }
 
 /// See `ExportOptions::overrides`.
@@ -179,6 +203,8 @@ impl Default for ExportOptions {
             overrides: None,
             keep_material_slots: false,
             skinned: false,
+            full_lod_under: Vec::new(),
+            skip_under: Vec::new(),
         }
     }
 }
@@ -631,8 +657,9 @@ fn load_geometry_parts(
     } else {
         resolved.parts[0].material_override.as_deref().unwrap_or(material_path)
     };
-    let (mut mesh, mtl_file, textures, mut nmc) =
+    let (mut mesh, mut mtl_file, mut textures, mut nmc) =
         load_single_mesh(p4k, &primary_path, effective_material, opts, png_cache, use_model_bbox)?;
+    let primary_own_material = part_material_path(p4k, &resolved.parts[0]);
 
     // ExportOptions::skinned, for a skin: it stays one mesh in its bind pose, each vertex with its bone weights,
     // and carries its own bones (its CompiledBones, which the weights' joint numbers point into), in the bind
@@ -672,9 +699,37 @@ fn load_geometry_parts(
     // bones' space, like the primary; every other part goes under the primary's root node, as it lies in the
     // model (a skin in its bind pose, a bone attachment moved by its bone).
     let no_tex_opts = ExportOptions { material_mode: MaterialMode::Colors, ..opts.clone() };
+    let mut own_material_parts = false;
     for part in &resolved.parts[1..] {
-        match load_single_mesh(p4k, &part.path, material_path, &no_tex_opts, png_cache, use_model_bbox) {
-            Ok((mut extra_mesh, _, _, extra_nmc)) => {
+        // A part whose own material (its .cdf entry's, else the one its mesh file names) isn't the main part's has
+        // a look of its own: the C54 "Epoque" (cosmetics/bsmg_fps_gmni_c54_store01.cdf) adds its gold ornaments
+        // (store_01_geo_a.cgf) with their own .mtl, the Mercenary LMG's Epoque its ornaments with none in the
+        // .cdf (the mesh names it). Its materials are added after the main ones, its pieces numbered past them;
+        // read with the main material, they took the gun's slots and the ornaments were drawn as gun parts
+        // (2026-10-28)
+        let own_material = mtl_file
+            .is_some()
+            .then(|| part_material_path(p4k, part))
+            .flatten()
+            .filter(|m| !primary_own_material.as_deref().is_some_and(|p| same_game_path(m, p)));
+        let (part_material, part_opts) = match own_material.as_deref() {
+            Some(m) => (m, opts),
+            None => (material_path, &no_tex_opts),
+        };
+        match load_single_mesh(p4k, &part.path, part_material, part_opts, png_cache, use_model_bbox) {
+            Ok((mut extra_mesh, extra_mtl, extra_textures, extra_nmc)) => {
+                if let (Some(_), Some(main), Some(extra)) = (own_material, mtl_file.as_mut(), extra_mtl) {
+                    let offset = main.materials.len() as u32;
+                    for sub in &mut extra_mesh.submeshes {
+                        sub.material_id += offset;
+                    }
+                    let added = extra.materials.len();
+                    main.materials.extend(extra.materials);
+                    if let Some(main_textures) = textures.as_mut() {
+                        main_textures.append(offset as usize, extra_textures, added);
+                    }
+                    own_material_parts = true;
+                }
                 log::debug!(
                     "  CDF part '{}': {} vertices, pieces (material, node) {:?}",
                     part.path,
@@ -722,6 +777,9 @@ fn load_geometry_parts(
             Err(e) => log::warn!("  CDF part '{}' failed: {e}", part.path),
         }
     }
+    // With parts of its own look the mesh is no longer its main part's: it's named after its .cdf, so it doesn't
+    // take the file of the plain model sharing that part (the C54 Epoque's ..._c54_parts.skin is the C54's too)
+    let primary_path = if own_material_parts { geometry_path.to_string() } else { primary_path };
 
     Ok((
         mesh,
@@ -1985,6 +2043,9 @@ pub struct InteriorCgfEntry {
     pub cgf_path: String,
     pub material_path: Option<String>,
     pub name: String,
+    /// Under one of `ExportOptions::full_lod_under`: loaded at LOD 0 whatever `lod_level` says, and marked
+    /// `"full_lod": true` in the GLB mesh's extras.
+    pub full_lod: bool,
 }
 
 /// One interior container's placement data.
@@ -2030,7 +2091,7 @@ fn load_interiors(
         }
     }
 
-    build_interiors_from_payloads(db, p4k, &payloads, opts.include_lights)
+    build_interiors_from_payloads(db, p4k, &payloads, opts)
 }
 
 /// Shared interior building: dedup CGFs, resolve GUIDs, collect placements and lights.
@@ -2039,9 +2100,10 @@ fn build_interiors_from_payloads(
     db: &Database,
     p4k: &MappedP4k,
     payloads: &[crate::types::InteriorPayload],
-    include_lights: bool,
+    opts: &ExportOptions,
 ) -> LoadedInteriors {
     use std::collections::HashMap;
+    let include_lights = opts.include_lights;
     use starbreaker_common::CigGuid;
     use std::str::FromStr;
 
@@ -2091,6 +2153,9 @@ fn build_interiors_from_payloads(
             } else {
                 continue;
             };
+            if opts.under(&opts.skip_under, &cgf_path) {
+                continue;  // ExportOptions::skip_under
+            }
 
             let mesh_idx = *cgf_cache.entry(cgf_path.clone()).or_insert_with(|| {
                 let idx = unique_cgfs.len();
@@ -2105,6 +2170,7 @@ fn build_interiors_from_payloads(
                     cgf_path: cgf_path.clone(),
                     material_path: mtl_path.clone().or_else(|| im.material_path.clone()),
                     name,
+                    full_lod: opts.full_lod_for(&cgf_path),
                 });
                 Some(idx)
             });
@@ -2546,6 +2612,7 @@ fn expand_loadout_into_placements(
                 cgf_path: geom_owned.clone(),
                 material_path: mtl_owned.clone(),
                 name,
+                full_lod: false,  // items attached to an entity: not rocks
             });
             Some(idx)
         });
@@ -2661,6 +2728,13 @@ fn load_interior_mesh_asset(
     opts: &ExportOptions,
     png_cache: &mut PngCache,
 ) -> Option<InteriorMeshAsset> {
+    let lod0;
+    let opts = if entry.full_lod && opts.lod_level > 0 {
+        lod0 = ExportOptions { lod_level: 0, ..opts.clone() };
+        &lod0
+    } else {
+        opts
+    };
     match export_cgf_from_path(
         p4k,
         &entry.cgf_path,
@@ -2670,17 +2744,13 @@ fn load_interior_mesh_asset(
         false,
     ) {
         Ok((mesh, mtl, _tex, nmc, _palette, _, _, _bones, _skeleton_source_path)) => {
-            let needs_bake = mesh
-                .scaling_min
-                .iter()
-                .zip(&mesh.model_min)
-                .chain(mesh.scaling_max.iter().zip(&mesh.model_max))
-                .any(|(s, m)| (s - m).abs() > 0.01);
-            let mesh = if needs_bake {
-                bake_nmc_into_mesh(mesh, nmc.as_ref(), false)
-            } else {
-                mesh
-            };
+            // Every piece is in its node's own space here (root_pieces_to_root_space moved the root's pieces
+            // there when the two bboxes are equal; with different bboxes they were decoded that way), and the
+            // interior writer places meshes without their node chunk, so the node transforms are baked in
+            // either way. Baking only when the bboxes differ left the root's turn undone on meshes with a turned
+            // root and equal bboxes: DC catwalk rails, platforms and scaffold beams on their side, half of
+            // struct_m_base_sec_001's 1339 pieces off their own bbox (2026-10-30).
+            let mesh = bake_nmc_into_mesh(mesh, nmc.as_ref(), false);
             Some((mesh, mtl, nmc))
         }
         Err(e) => {
@@ -5254,6 +5324,28 @@ fn transform_mesh_by_bone(mesh: &mut crate::Mesh, bone: &crate::skeleton::Bone) 
     mesh.model_max = new_max.into();
 }
 
+/// The material a .cdf part is drawn with when nothing overrides it: its entry's Material, else the one its mesh
+/// file names (MtlName), as a game path (Objects/.../name.mtl). None when neither gives one.
+fn part_material_path(p4k: &MappedP4k, part: &GeometryPart) -> Option<String> {
+    if let Some(m) = &part.material_override {
+        return Some(with_mtl_extension(m));
+    }
+    let p4k_geom_path = datacore_path_to_p4k(&part.path);
+    let metadata = p4k.entry_case_insensitive(&p4k_geom_path).and_then(|entry| p4k.read(entry).ok())?;
+    let name = mtl::extract_mtl_name(&metadata)?;
+    let path = resolve_mtl_p4k_path(&name, &p4k_geom_path).replace('\\', "/");
+    Some(path.strip_prefix("Data/").map(str::to_string).unwrap_or(path))
+}
+
+/// Two game file paths name the same file: case, slashes, a leading Data/ and a missing .mtl aside.
+fn same_game_path(a: &str, b: &str) -> bool {
+    let norm = |p: &str| {
+        let p = with_mtl_extension(p).replace('\\', "/").to_ascii_lowercase();
+        p.strip_prefix("data/").map(str::to_string).unwrap_or(p)
+    };
+    norm(a) == norm(b)
+}
+
 /// Put every piece of a mesh lying in model space under the root node of a node chunk: the glTF writer reads a
 /// piece's vertices in its node's space, so they're moved by the inverse of the root's transform (most roots
 /// are the identity).
@@ -5290,7 +5382,17 @@ fn file_under_root_node(mesh: &mut crate::Mesh, combo: &crate::nmc::NodeMeshComb
 /// vertices already at that spot, and with the node's transform on top the disc floated 10 cm off the device
 /// (2026-10-24). They're moved by the inverse of the root's transform, so the glTF writer puts them back; pieces
 /// on other nodes are untouched. Vertices shared with a piece on another node are left alone.
+/// Only when the mesh's scaling bbox is its model bbox: when they differ, the positions (decoded with the scaling
+/// bbox) are in the nodes' own space and still need the root's transform. The DC stairs
+/// (util_stairs_a_start_03_b.cgf: root turned 90 degrees, scaling bbox = model bbox with the axes swapped) came out
+/// on their side or half turned in socpak exports (2026-10-30); the lens's two bboxes are equal.
 fn root_pieces_to_root_space(mesh: &mut crate::Mesh, combo: &crate::nmc::NodeMeshCombo) {
+    let boxes_differ = mesh.scaling_min.iter().zip(&mesh.model_min)
+        .chain(mesh.scaling_max.iter().zip(&mesh.model_max))
+        .any(|(s, m)| (s - m).abs() > 0.01);
+    if boxes_differ {
+        return;
+    }
     let Some(root) = combo.nodes.iter().position(|node| node.parent_index.is_none()) else {
         return;
     };
@@ -6001,7 +6103,25 @@ pub fn socpaks_to_glb(
     socpak_paths: &[String],
     opts: &ExportOptions,
 ) -> Result<Vec<u8>, Error> {
+    let mut out = None;
+    socpaks_to_glbs(db, p4k, &[socpak_paths.to_vec()], opts, |_, glb| out = Some(glb))?;
+    out.expect("one group in, one result out")
+}
+
+/// Export several socpak groups, one GLB each, in one run: the P4k and DataCore are opened once (by the caller) and
+/// every distinct mesh of all the groups is loaded once, in parallel, then shared. Made for building one model per
+/// module of a place for the spawn point maps (2026-10-30): one process per module spent ~1.8 s of its ~3 s
+/// starting up, and modules share many meshes (the 26 Distribution Centre shells: 4,271 loads, 2,273 distinct).
+/// `on_done(i, glb)` gets each group's result as soon as it's written (i = index into `groups`).
+pub fn socpaks_to_glbs(
+    db: &Database,
+    p4k: &MappedP4k,
+    groups: &[Vec<String>],
+    opts: &ExportOptions,
+    mut on_done: impl FnMut(usize, Result<Vec<u8>, Error>),
+) -> Result<(), Error> {
     use crate::socpak;
+    use rayon::prelude::*;
 
     ensure_supported_export_options(opts)?;
 
@@ -6012,90 +6132,101 @@ pub fn socpaks_to_glb(
         [0.0, 0.0, 0.0, 1.0],
     ];
 
-    let mut payloads = Vec::new();
-    for socpak_path in socpak_paths {
-        match socpak::load_interior_from_socpak(p4k, socpak_path, identity) {
-            Ok(p) => payloads.push(p),
-            Err(e) => log::warn!("failed to load {socpak_path}: {e}"),
-        }
-    }
-
-    let interiors = build_interiors_from_payloads(db, p4k, &payloads, opts.include_lights);
+    let all_interiors: Vec<LoadedInteriors> = groups
+        .iter()
+        .map(|socpak_paths| {
+            let mut payloads = Vec::new();
+            for socpak_path in socpak_paths {
+                match socpak::load_interior_from_socpak(p4k, socpak_path, identity) {
+                    Ok(p) => payloads.push(p),
+                    Err(e) => log::warn!("failed to load {socpak_path}: {e}"),
+                }
+            }
+            build_interiors_from_payloads(db, p4k, &payloads, opts)
+        })
+        .collect();
 
     let no_tex_opts = ExportOptions {
         material_mode: MaterialMode::Colors,
         ..opts.clone()
     };
-    let mut no_tex: Box<
-        dyn FnMut(
-            Option<&crate::mtl::MtlFile>,
-            Option<&crate::mtl::TintPalette>,
-        ) -> Option<MaterialTextures>,
-    > = Box::new(|_, _| None);
-    let mut interior_png_cache = PngCache::new();
-    let mut interior_mesh_loader =
-        |entry: &InteriorCgfEntry| -> Option<(crate::Mesh, Option<mtl::MtlFile>, Option<crate::nmc::NodeMeshCombo>)> {
-            match export_cgf_from_path(
-                p4k,
-                &entry.cgf_path,
-                entry.material_path.as_deref(),
-                &no_tex_opts,
-                &mut interior_png_cache,
-                false,
-            ) {
-                Ok((mesh, mtl, _tex, nmc, _palette, _, _, _bones, _skeleton_source_path)) => {
-                    let needs_bake = mesh.scaling_min.iter().zip(&mesh.model_min)
-                        .chain(mesh.scaling_max.iter().zip(&mesh.model_max))
-                        .any(|(s, m)| (s - m).abs() > 0.01);
-                    let mesh = if needs_bake {
-                        bake_nmc_into_mesh(mesh, nmc.as_ref(), false)
-                    } else {
-                        mesh
-                    };
-                    Some((mesh, mtl, nmc))
-                }
-                Err(e) => {
-                    log::warn!("failed to load CGF {}: {e}", entry.cgf_path);
-                    None
-                }
-            }
-        };
 
-    crate::gltf::write_glb(
-        crate::gltf::GlbInput {
-            root_mesh: None,
-            root_materials: None,
-            root_textures: None,
-            root_nmc: None,
-            root_palette: None,
-            skeleton_bones: Vec::new(),
-            children: Vec::new(),
-            interiors,
-        },
-        &mut crate::gltf::GlbLoaders {
-            load_textures: &mut no_tex,
-            load_interior_mesh: &mut interior_mesh_loader,
-        },
-        &crate::gltf::GlbOptions {
-            material_mode: opts.material_mode,
-            preserve_textureless_decal_primitives: false,
-            metadata: crate::gltf::GlbMetadata {
-                entity_name: None,
-                geometry_path: None,
-                material_path: None,
-                export_options: crate::gltf::ExportOptionsMetadata {
-                    kind: format!("{:?}", opts.kind),
-                    material_mode: format!("{:?}", opts.material_mode),
-                    format: format!("{:?}", opts.format),
-                    lod_level: opts.lod_level,
-                    texture_mip: opts.texture_mip,
-                    include_attachments: opts.include_attachments,
-                    include_interior: opts.include_interior,
-                },
+    // Every distinct mesh of every group, loaded up front in parallel (one at a time, a Distribution Centre's 26
+    // shell modules took ~25 min, ~0.4 s per mesh) and shared between the groups. Keyed by mesh path, like the
+    // per-group dedup.
+    let mut distinct: Vec<&InteriorCgfEntry> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for interiors in &all_interiors {
+        for entry in &interiors.unique_cgfs {
+            if seen.insert(entry.cgf_path.clone()) {
+                distinct.push(entry);
+            }
+        }
+    }
+    let shared: std::collections::HashMap<String, InteriorMeshAsset> = distinct
+        .par_iter()
+        .filter_map(|entry| {
+            let mut png_cache = PngCache::new();
+            load_interior_mesh_asset(p4k, entry, &no_tex_opts, &mut png_cache)
+                .map(|asset| (entry.cgf_path.clone(), asset))
+        })
+        .collect();
+
+    for (i, interiors) in all_interiors.into_iter().enumerate() {
+        let mut no_tex: Box<
+            dyn FnMut(
+                Option<&crate::mtl::MtlFile>,
+                Option<&crate::mtl::TintPalette>,
+            ) -> Option<MaterialTextures>,
+        > = Box::new(|_, _| None);
+        let mut interior_png_cache = PngCache::new();
+        let mut interior_mesh_loader =
+            |entry: &InteriorCgfEntry| -> Option<(crate::Mesh, Option<mtl::MtlFile>, Option<crate::nmc::NodeMeshCombo>)> {
+                if let Some(asset) = shared.get(&entry.cgf_path) {
+                    return Some(asset.clone());
+                }
+                // a mesh that failed to preload: one more try on its own, as the single-group export did
+                load_interior_mesh_asset(p4k, entry, &no_tex_opts, &mut interior_png_cache)
+            };
+
+        let glb = crate::gltf::write_glb(
+            crate::gltf::GlbInput {
+                root_mesh: None,
+                root_materials: None,
+                root_textures: None,
+                root_nmc: None,
+                root_palette: None,
+                skeleton_bones: Vec::new(),
+                children: Vec::new(),
+                interiors,
             },
-            fallback_palette: None,
-        },
-    )
+            &mut crate::gltf::GlbLoaders {
+                load_textures: &mut no_tex,
+                load_interior_mesh: &mut interior_mesh_loader,
+            },
+            &crate::gltf::GlbOptions {
+                material_mode: opts.material_mode,
+                preserve_textureless_decal_primitives: false,
+                metadata: crate::gltf::GlbMetadata {
+                    entity_name: None,
+                    geometry_path: None,
+                    material_path: None,
+                    export_options: crate::gltf::ExportOptionsMetadata {
+                        kind: format!("{:?}", opts.kind),
+                        material_mode: format!("{:?}", opts.material_mode),
+                        format: format!("{:?}", opts.format),
+                        lod_level: opts.lod_level,
+                        texture_mip: opts.texture_mip,
+                        include_attachments: opts.include_attachments,
+                        include_interior: opts.include_interior,
+                    },
+                },
+                fallback_palette: None,
+            },
+        );
+        on_done(i, glb);
+    }
+    Ok(())
 }
 
 /// Write NMC node properties for a geometry path into the JSON output.

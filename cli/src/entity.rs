@@ -186,10 +186,11 @@ pub enum EntityCommand {
     ExportList {
         /// JSON list: [{"record": "<exact name>", "body": "male|female|prop", "material": "<.mtl path>",
         /// "palette": "<TintPaletteTree name|none>", "group": "<id>", "geometry": "<.cgf/.cga path>",
-        /// "name": "<package name>"}]. Only record is required. Consecutive entries with the same group run one
+        /// "name": "<package name>", "model": "<.cdf/.cgf path>"}]. Only record is required. Consecutive entries with the same group run one
         /// after the other on one worker (variants of one model share textures). geometry: that mesh is exported
         /// through the record (a carrier, its attachments dropped), for meshes with no record of their own
-        /// (trees, grass); give it its material, and palette "none"
+        /// (trees, grass); give it its material, and palette "none". model: the record's own item drawn with
+        /// another of its models (a weapon variant's tagged SubGeometry, e.g. a cosmetics .cdf), attachments kept
         list: PathBuf,
         /// Output folder (Data/ and Packages/ go in it)
         output: PathBuf,
@@ -393,6 +394,8 @@ struct ListEntry {
     /// Mesh exported through the record instead of its own, and its package name (see ExportList)
     geometry: Option<String>,
     name: Option<String>,
+    /// Model drawn instead of the record's own, attachments kept (see ExportList)
+    model: Option<String>,
 }
 
 fn read_export_list(path: &Path) -> Result<Vec<ListEntry>> {
@@ -417,6 +420,7 @@ fn read_export_list(path: &Path) -> Result<Vec<ListEntry>> {
                 group: text_field(item, "group"),
                 geometry: text_field(item, "geometry"),
                 name: text_field(item, "name"),
+                model: text_field(item, "model"),
             })
         })
         .collect()
@@ -439,12 +443,12 @@ fn export_list_entry(
     let rname = db.resolve_string2(record.name_offset);
     let mut export_opts = base_opts.clone();
     export_opts.body = (entry.body != "prop").then(|| entry.body.clone());
-    if entry.material.is_some() || entry.palette.is_some() || entry.geometry.is_some() {
+    if entry.material.is_some() || entry.palette.is_some() || entry.geometry.is_some() || entry.model.is_some() {
         export_opts.overrides = Some(starbreaker_3d::EntityOverrides {
             record: export_entity_name(rname),
             material: entry.material.clone(),
             palette: entry.palette.clone(),
-            geometry: entry.geometry.clone(),
+            geometry: entry.geometry.clone().or_else(|| entry.model.clone()),
         });
     }
     let mut tree = resolve_loadout_indexed(idx, record);

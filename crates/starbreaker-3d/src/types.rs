@@ -504,6 +504,31 @@ pub struct MaterialTextures {
     pub bundled_fallbacks: Vec<Vec<String>>,
 }
 
+impl MaterialTextures {
+    /// Add another material file's textures after the first `at` submaterials (`count` of them; not loaded:
+    /// empty entries), so every list stays indexed by submaterial.
+    pub fn append(&mut self, at: usize, other: Option<MaterialTextures>, count: usize) {
+        fn put<T: Clone>(list: &mut Vec<T>, at: usize, empty: T, more: Option<Vec<T>>, count: usize) {
+            list.resize(at, empty.clone());
+            let mut more = more.unwrap_or_default();
+            more.resize(count, empty);
+            list.extend(more);
+        }
+        let mut o = other;
+        put(&mut self.diffuse, at, None, o.as_mut().map(|o| std::mem::take(&mut o.diffuse)), count);
+        put(&mut self.normal, at, None, o.as_mut().map(|o| std::mem::take(&mut o.normal)), count);
+        put(&mut self.roughness, at, None, o.as_mut().map(|o| std::mem::take(&mut o.roughness)), count);
+        put(&mut self.emissive, at, None, o.as_mut().map(|o| std::mem::take(&mut o.emissive)), count);
+        put(&mut self.occlusion, at, None, o.as_mut().map(|o| std::mem::take(&mut o.occlusion)), count);
+        put(&mut self.diffuse_transform, at, None, o.as_mut().map(|o| std::mem::take(&mut o.diffuse_transform)), count);
+        put(&mut self.normal_transform, at, None, o.as_mut().map(|o| std::mem::take(&mut o.normal_transform)), count);
+        put(&mut self.roughness_transform, at, None, o.as_mut().map(|o| std::mem::take(&mut o.roughness_transform)), count);
+        put(&mut self.emissive_transform, at, None, o.as_mut().map(|o| std::mem::take(&mut o.emissive_transform)), count);
+        put(&mut self.occlusion_transform, at, None, o.as_mut().map(|o| std::mem::take(&mut o.occlusion_transform)), count);
+        put(&mut self.bundled_fallbacks, at, Vec::new(), o.as_mut().map(|o| std::mem::take(&mut o.bundled_fallbacks)), count);
+    }
+}
+
 /// A resolved loadout node — lightweight metadata for attachment resolution.
 /// Mesh data is NOT stored here; it's loaded on demand by the consumer.
 /// NMC is loaded from .cga even when .cgam (mesh) is missing.

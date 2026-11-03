@@ -112,6 +112,23 @@ impl IncludedObjects {
                         }
                     }
 
+                    // A real placement has a finite turn + scale (each axis 1e-3..1e3 long) and a finite position
+                    // inside a container (< 1e9 m: a Lagrange point's container places its station up to ~50,000
+                    // km from its marker). Reading out of step lands here too, on a 1 that is part of
+                    // another object: Teach's Ship Shop (teachsshipshop.socpak) gave 41 such "objects" with NaN
+                    // and 1e29 entries, triangles across the whole sky on the map (2026-11-02). Not an object:
+                    // move on 4 bytes, like an unknown type.
+                    let sane = transform.iter().take(3).all(|axis| {
+                        let len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+                        len.is_finite() && (1e-3..1e3).contains(&len)
+                    }) && transform[3].iter().all(|v| v.is_finite() && v.abs() < 1e9)
+                        && (id as usize) < cgf_paths.len();
+                    if !sane {
+                        log::debug!("IncludedObjects: Type1 marker at offset {off} with no sane transform, skipped");
+                        off += 4;
+                        continue;
+                    }
+
                     let unknown3 = read_u64_at(data, off + 160)?;
                     // Scan forward for the next valid object type marker to determine actual size
                     let actual_size = if unknown3 == 0 {

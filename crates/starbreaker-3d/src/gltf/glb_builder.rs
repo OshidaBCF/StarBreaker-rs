@@ -989,6 +989,11 @@ impl GlbBuilder {
                         material_mode,
                         false,
                     );
+                    if interiors.unique_cgfs[mesh_array_idx].full_lod {
+                        // loaded at LOD 0 (ExportOptions::full_lod_under): a reader may simplify it itself
+                        self.meshes_json[packed.mesh_idx as usize].extras =
+                            serde_json::value::RawValue::from_string(r#"{"full_lod":true}"#.into()).ok().map(Into::into);
+                    }
                     packed_cache.insert(cache_key, packed.mesh_idx);
                     Some(packed.mesh_idx)
                 };
